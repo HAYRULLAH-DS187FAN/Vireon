@@ -11,10 +11,12 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -25,7 +27,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -33,11 +34,10 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.ContentCut
-import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Layers
+import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.MusicNote
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Tune
@@ -48,12 +48,11 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -85,6 +84,16 @@ import com.vireon.editor.ui.theme.VireonSurface
 import com.vireon.editor.ui.theme.VireonSurfaceElevated
 import com.vireon.editor.ui.theme.VireonText
 import com.vireon.editor.ui.theme.VireonTheme
+import kotlinx.coroutines.delay
+
+private data class TimelineClip(
+    val id: Long,
+    val startMs: Long,
+    val endMs: Long
+) {
+    val durationMs: Long
+        get() = (endMs - startMs).coerceAtLeast(0L)
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -269,7 +278,121 @@ private fun EditorScreen(
     onExport: () -> Unit
 ) {
     val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val context = LocalContext.current
     var selectedTool by rememberSaveable { mutableStateOf("Düzenle") }
+    var clips by remember(videoUri) { mutableStateOf(emptyList<TimelineClip>()) }
+    var selectedIndex by remember(videoUri) { mutableStateOf(0) }
+    var currentPositionMs by remember(videoUri) { mutableStateOf(0L) }
+    var sourceDurationMs by remember(videoUri) { mutableStateOf(0L) }
+    var nextClipId by remember(videoUri) { mutableStateOf(2L) }
+
+    val player = remember(videoUri) {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(videoUri))
+            prepare()
+        }
+    }
+
+    DisposableEffect(player) {
+        onDispose { player.release() }
+    }
+
+    LaunchedEffect(player) {
+        while (sourceDurationMs <= 0L) {
+            val duration = player.duration
+            if (duration > 0L) {
+                sourceDurationMs = duration
+                clips = listOf(TimelineClip(id = 1L, startMs = 0L, endMs = duration))
+                selectedIndex = 0
+                break
+            }
+            delay(100L)
+        }
+
+        while (true) {
+            val activeIndex = player.currentMediaItemIndex
+            if (activeIndex in clips.indices) {
+                selectedIndex = activeIndex
+                currentPositionMs = player.currentPosition.coerceAtLeast(0L)
+            }
+            delay(100L)
+        }
+    }
+
+    fun applyClips(updatedClips: List<TimelineClip>, targetIndex: Int) {
+        if (updatedClips.isEmpty()) return
+        val safeIndex = targetIndex.coerceIn(updatedClips.indices)
+        clips = updatedClips
+        selectedIndex = safeIndex
+        currentPositionMs = 0L
+        player.pause()
+
+        val mediaItems = updatedClips.map { clip ->
+            MediaItem.Builder()
+                .setUri(videoUri)
+                .setClippingConfiguration(
+                    MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(clip.startMs)
+                        .setEndPositionMs(clip.endMs)
+                        .build()
+                )
+                .build()
+        }
+        player.setMediaItems(mediaItems, safeIndex, 0L)
+        player.prepare()
+    }
+
+    fun trimClipStart() {
+        val clip = clips.getOrNull(selectedIndex) ?: return
+        val newStart = clip.startMs + player.currentPosition.coerceAtLeast(0L)
+        if (newStart >= clip.endMs - 500L) {
+            Toast.makeText(context, "Klipte en az yarım saniye kalmalı.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val updated = clips.toMutableList()
+        updated[selectedIndex] = clip.copy(startMs = newStart)
+        applyClips(updated, selectedIndex)
+    }
+
+    fun trimClipEnd() {
+        val clip = clips.getOrNull(selectedIndex) ?: return
+        val newEnd = clip.startMs + player.currentPosition.coerceAtLeast(0L)
+        if (newEnd <= clip.startMs + 500L) {
+            Toast.makeText(context, "Klipte en az yarım saniye kalmalı.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val updated = clips.toMutableList()
+        updated[selectedIndex] = clip.copy(endMs = newEnd.coerceAtMost(clip.endMs))
+        applyClips(updated, selectedIndex)
+    }
+
+    fun splitClip() {
+        val clip = clips.getOrNull(selectedIndex) ?: return
+        val splitAt = clip.startMs + player.currentPosition.coerceAtLeast(0L)
+        if (splitAt < clip.startMs + 500L || splitAt > clip.endMs - 500L) {
+            Toast.makeText(context, "Bölmek için imleci klibin içine taşı.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val updated = clips.toMutableList()
+        updated.removeAt(selectedIndex)
+        updated.add(selectedIndex, clip.copy(endMs = splitAt))
+        updated.add(
+            selectedIndex + 1,
+            TimelineClip(id = nextClipId, startMs = splitAt, endMs = clip.endMs)
+        )
+        nextClipId += 1L
+        applyClips(updated, selectedIndex + 1)
+    }
+
+    fun moveSelectedClip(offset: Int) {
+        val targetIndex = selectedIndex + offset
+        if (targetIndex !in clips.indices) return
+        val updated = clips.toMutableList()
+        val movingClip = updated.removeAt(selectedIndex)
+        updated.add(targetIndex, movingClip)
+        applyClips(updated, targetIndex)
+    }
 
     Column(
         modifier = Modifier
@@ -286,7 +409,7 @@ private fun EditorScreen(
             )
             Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
                 VideoPreview(
-                    uri = videoUri,
+                    player = player,
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(if (isLandscape) 0.62f else 0.56f)
@@ -294,6 +417,19 @@ private fun EditorScreen(
                 )
                 TimelinePanel(
                     audioLabel = audioLabel,
+                    clips = clips,
+                    selectedIndex = selectedIndex,
+                    currentPositionMs = currentPositionMs,
+                    onSelectClip = { index ->
+                        selectedIndex = index
+                        currentPositionMs = 0L
+                        player.seekTo(index, 0L)
+                    },
+                    onTrimStart = ::trimClipStart,
+                    onTrimEnd = ::trimClipEnd,
+                    onSplit = ::splitClip,
+                    onMoveLeft = { moveSelectedClip(-1) },
+                    onMoveRight = { moveSelectedClip(1) },
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(if (isLandscape) 0.38f else 0.44f)
@@ -385,19 +521,7 @@ private fun ToolRail(
 }
 
 @Composable
-private fun VideoPreview(uri: Uri, modifier: Modifier = Modifier) {
-    val context = LocalContext.current
-    val player = remember(uri) {
-        ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(uri))
-            prepare()
-        }
-    }
-
-    DisposableEffect(player) {
-        onDispose { player.release() }
-    }
-
+private fun VideoPreview(player: ExoPlayer, modifier: Modifier = Modifier) {
     AndroidView(
         modifier = modifier.clip(RoundedCornerShape(16.dp)).background(Color.Black),
         factory = { viewContext ->
@@ -412,51 +536,138 @@ private fun VideoPreview(uri: Uri, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun TimelinePanel(audioLabel: String?, modifier: Modifier = Modifier) {
+private fun TimelinePanel(
+    audioLabel: String?,
+    clips: List<TimelineClip>,
+    selectedIndex: Int,
+    currentPositionMs: Long,
+    onSelectClip: (Int) -> Unit,
+    onTrimStart: () -> Unit,
+    onTrimEnd: () -> Unit,
+    onSplit: () -> Unit,
+    onMoveLeft: () -> Unit,
+    onMoveRight: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val selectedClip = clips.getOrNull(selectedIndex)
+    val canSplit = selectedClip != null &&
+        currentPositionMs >= 500L &&
+        currentPositionMs <= selectedClip.durationMs - 500L
+    val canTrimStart = selectedClip != null &&
+        currentPositionMs >= 500L &&
+        currentPositionMs < selectedClip.durationMs - 500L
+    val canTrimEnd = selectedClip != null &&
+        currentPositionMs >= 500L &&
+        currentPositionMs < selectedClip.durationMs
+
     Column(
         modifier = modifier
             .background(VireonSurface)
-            .padding(horizontal = 10.dp, vertical = 9.dp)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 9.dp, vertical = 8.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Zaman çizelgesi", color = VireonText, fontSize = 13.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.weight(1f))
-            Text("30 FPS", color = VireonMuted, fontSize = 10.sp)
+            Text(
+                if (clips.isEmpty()) "Video hazırlanıyor…" else "Klip ${selectedIndex + 1}/${clips.size}",
+                color = VireonMuted,
+                fontSize = 10.sp
+            )
         }
-        Spacer(Modifier.height(8.dp))
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            listOf("00:00", "00:05", "00:10", "00:15", "00:20").forEach {
-                Text(it, color = VireonMuted, fontSize = 9.sp)
+
+        Spacer(Modifier.height(3.dp))
+        Text(
+            if (selectedClip == null) "Video süresi okunuyor"
+            else "İmleç ${formatTimelineTime(currentPositionMs)}  •  Klip ${formatTimelineTime(selectedClip.durationMs)}",
+            color = VireonMuted,
+            fontSize = 10.sp
+        )
+
+        Spacer(Modifier.height(6.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            TimelineAction("Böl", canSplit, onSplit)
+            TimelineAction("Başı kırp", canTrimStart, onTrimStart)
+            TimelineAction("Sonu kırp", canTrimEnd, onTrimEnd)
+            TimelineAction("←", selectedIndex > 0, onMoveLeft)
+            TimelineAction("→", selectedIndex >= 0 && selectedIndex < clips.lastIndex, onMoveRight)
+        }
+
+        Spacer(Modifier.height(7.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            clips.forEachIndexed { index, clip ->
+                val chipWidth = (clip.durationMs / 1000f * 28f).coerceIn(88f, 180f).dp
+                Column(
+                    modifier = Modifier
+                        .width(chipWidth)
+                        .height(42.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (index == selectedIndex) VireonBlue else VireonBlueSoft)
+                        .clickable { onSelectClip(index) }
+                        .padding(horizontal = 8.dp, vertical = 5.dp),
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        "Klip ${index + 1}",
+                        color = Color.White,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1
+                    )
+                    Text(
+                        formatTimelineTime(clip.durationMs),
+                        color = Color.White.copy(alpha = 0.82f),
+                        fontSize = 9.sp
+                    )
+                }
+            }
+            if (clips.isEmpty()) {
+                Text("Video hazırlanıyor…", color = VireonMuted, fontSize = 10.sp)
             }
         }
+
         Spacer(Modifier.height(7.dp))
-        TimelineTrack(
-            icon = Icons.Default.Movie,
-            label = "Video klibi",
-            color = VireonBlueSoft,
-            modifier = Modifier.weight(1f)
-        )
-        Spacer(Modifier.height(5.dp))
         TimelineTrack(
             icon = Icons.Default.MusicNote,
             label = audioLabel ?: "Müzik ekle",
             color = VireonPurple,
-            modifier = Modifier.weight(1f)
+            modifier = Modifier.height(22.dp)
         )
-        Spacer(Modifier.height(5.dp))
+        Spacer(Modifier.height(4.dp))
         TimelineTrack(
             icon = Icons.Default.TextFields,
             label = "Metin katmanı",
             color = VireonGreen,
-            modifier = Modifier.weight(1f)
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(
-            "Zaman çizelgesi araçları geliştirme aşamasında.",
-            color = VireonMuted,
-            fontSize = 9.sp
+            modifier = Modifier.height(22.dp)
         )
     }
+}
+
+@Composable
+private fun TimelineAction(label: String, enabled: Boolean, onClick: () -> Unit) {
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.height(32.dp),
+        contentPadding = PaddingValues(horizontal = 9.dp, vertical = 0.dp),
+        shape = RoundedCornerShape(9.dp)
+    ) {
+        Text(label, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+private fun formatTimelineTime(milliseconds: Long): String {
+    val totalSeconds = milliseconds.coerceAtLeast(0L) / 1000L
+    val minutes = totalSeconds / 60L
+    val seconds = totalSeconds % 60L
+    return "%02d:%02d".format(minutes, seconds)
 }
 
 @Composable
