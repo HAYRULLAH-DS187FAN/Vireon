@@ -21,6 +21,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -112,6 +113,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 private enum class VisualKind { VIDEO, IMAGE }
 
@@ -138,7 +140,8 @@ private data class AudioClip(
     val timelineStartMs: Long,
     val sourceStartMs: Long,
     val sourceEndMs: Long,
-    val volume: Float = 1f
+    val volume: Float = 1f,
+    val sourceDurationMs: Long = sourceEndMs
 ) {
     val durationMs: Long
         get() = (sourceEndMs - sourceStartMs).coerceAtLeast(0L)
@@ -296,12 +299,6 @@ private fun EditorScreen(
     var showTextDialog by remember { mutableStateOf(false) }
     var editingTextId by remember { mutableStateOf<Long?>(null) }
     var textDraft by remember { mutableStateOf("") }
-    var draftStartMs by remember { mutableStateOf(0L) }
-    var draftEndMs by remember { mutableStateOf(3_000L) }
-    var draftX by remember { mutableStateOf(0.5f) }
-    var draftY by remember { mutableStateOf(0.72f) }
-    var draftSize by remember { mutableStateOf(26f) }
-    var draftRotation by remember { mutableStateOf(0f) }
 
     val previewPlayer = remember { ExoPlayer.Builder(context).build() }
     val audioPlayers = remember { mutableMapOf<Long, ExoPlayer>() }
@@ -360,7 +357,8 @@ private fun EditorScreen(
                         name = info.first,
                         timelineStartMs = start,
                         sourceStartMs = 0L,
-                        sourceEndMs = usableDuration
+                        sourceEndMs = usableDuration,
+                        sourceDurationMs = info.second.coerceAtLeast(usableDuration)
                     )
                     audioClips = audioClips + clip
                     selectedAudioId = clip.id
@@ -406,13 +404,6 @@ private fun EditorScreen(
     fun openTextEditor(existing: TextOverlay? = null) {
         editingTextId = existing?.id
         textDraft = existing?.value.orEmpty()
-        draftStartMs = existing?.startMs ?: playheadMs.coerceAtMost((totalDurationMs - 250L).coerceAtLeast(0L))
-        draftEndMs = existing?.endMs ?: (draftStartMs + 3_000L).coerceAtMost(totalDurationMs)
-        if (draftEndMs <= draftStartMs) draftEndMs = (draftStartMs + 500L).coerceAtMost(totalDurationMs)
-        draftX = existing?.x ?: 0.5f
-        draftY = existing?.y ?: 0.72f
-        draftSize = existing?.sizeSp ?: 26f
-        draftRotation = existing?.rotationDegrees ?: 0f
         showTextDialog = true
     }
 
@@ -642,6 +633,38 @@ private fun EditorScreen(
         updateText(id) { it.copy(startMs = snapped, endMs = snapped + duration) }
     }
 
+    fun resizeAudioStart(id: Long, requestedStart: Long) {
+        val clip = audioClips.firstOrNull { it.id == id } ?: return
+        val minimumStart = (clip.timelineStartMs - clip.sourceStartMs).coerceAtLeast(0L)
+        val maximumStart = (clip.timelineEndMs - 250L).coerceAtLeast(minimumStart)
+        val newStart = requestedStart.coerceIn(minimumStart, maximumStart)
+        val sourceDelta = newStart - clip.timelineStartMs
+        val newSourceStart = (clip.sourceStartMs + sourceDelta).coerceIn(0L, clip.sourceEndMs - 250L)
+        updateAudio(id) { it.copy(timelineStartMs = newStart, sourceStartMs = newSourceStart) }
+    }
+
+    fun resizeAudioEnd(id: Long, requestedEnd: Long) {
+        val clip = audioClips.firstOrNull { it.id == id } ?: return
+        val minimumEnd = clip.timelineStartMs + 250L
+        val mediaMaximumEnd = clip.timelineStartMs + (clip.sourceDurationMs - clip.sourceStartMs).coerceAtLeast(250L)
+        val maximumEnd = minOf(totalDurationMs, mediaMaximumEnd).coerceAtLeast(minimumEnd)
+        val newEnd = requestedEnd.coerceIn(minimumEnd, maximumEnd)
+        val newSourceEnd = clip.sourceStartMs + (newEnd - clip.timelineStartMs)
+        updateAudio(id) { it.copy(sourceEndMs = newSourceEnd) }
+    }
+
+    fun resizeTextStart(id: Long, requestedStart: Long) {
+        val overlay = textOverlays.firstOrNull { it.id == id } ?: return
+        val newStart = requestedStart.coerceIn(0L, (overlay.endMs - 250L).coerceAtLeast(0L))
+        updateText(id) { it.copy(startMs = newStart) }
+    }
+
+    fun resizeTextEnd(id: Long, requestedEnd: Long) {
+        val overlay = textOverlays.firstOrNull { it.id == id } ?: return
+        val newEnd = requestedEnd.coerceIn(overlay.startMs + 250L, totalDurationMs)
+        updateText(id) { it.copy(endMs = newEnd) }
+    }
+
     val previousCut = cutBoundaries(visualClips).filter { it < playheadMs }.maxOrNull()
     val nextCut = cutBoundaries(visualClips).filter { it > playheadMs }.minOrNull()
 
@@ -666,7 +689,14 @@ private fun EditorScreen(
                     activeTexts = activeTexts,
                     isPlaying = isPlaying,
                     onTogglePlayback = { isPlaying = !isPlaying },
-                    onMoveText = { id, x, y -> updateText(id) { it.copy(x = x, y = y) } },
+                    onTransformText = { id, x, y, size, rotation ->
+                        updateText(id) { it.copy(x = x, y = y, sizeSp = size, rotationDegrees = rotation) }
+                    },
+                    onSelectText = { id ->
+                        selectedTextId = id
+                        selectedAudioId = null
+                        selectedVisualId = null
+                    },
                     modifier = Modifier.fillMaxWidth()
                         .weight(if (isLandscape) 0.56f else 0.46f)
                         .padding(start = 8.dp, end = 10.dp, top = 8.dp, bottom = 5.dp)
@@ -698,6 +728,10 @@ private fun EditorScreen(
                     onEditText = { id -> openTextEditor(textOverlays.firstOrNull { it.id == id }) },
                     onMoveAudio = ::moveAudio,
                     onMoveText = ::moveText,
+                    onResizeAudioStart = ::resizeAudioStart,
+                    onResizeAudioEnd = ::resizeAudioEnd,
+                    onResizeTextStart = ::resizeTextStart,
+                    onResizeTextEnd = ::resizeTextEnd,
                     canPreviousCut = previousCut != null,
                     canNextCut = nextCut != null,
                     onPreviousCut = { previousCut?.let { setTimelinePosition(it, false) } },
@@ -726,7 +760,7 @@ private fun EditorScreen(
             onDismissRequest = { showTextDialog = false },
             title = { Text(if (editingTextId == null) "Yazı ekle" else "Yazıyı düzenle") },
             text = {
-                Column(Modifier.height(420.dp).verticalScroll(rememberScrollState())) {
+                Column {
                     OutlinedTextField(
                         value = textDraft,
                         onValueChange = { textDraft = it.take(120) },
@@ -737,44 +771,29 @@ private fun EditorScreen(
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(12.dp))
-                    Text("Başlangıç: ${formatTimelineTime(draftStartMs)}", color = VireonText, fontSize = 12.sp)
-                    Slider(
-                        value = draftStartMs.toFloat().coerceIn(0f, totalDurationMs.coerceAtLeast(1L).toFloat()),
-                        onValueChange = { value ->
-                            draftStartMs = value.toLong().coerceAtMost((totalDurationMs - 250L).coerceAtLeast(0L))
-                            if (draftEndMs <= draftStartMs) draftEndMs = (draftStartMs + 250L).coerceAtMost(totalDurationMs)
-                        },
-                        valueRange = 0f..totalDurationMs.coerceAtLeast(1L).toFloat()
+                    Text(
+                        "Konum, boyut ve eğim önizleme ekranında ayarlanır. Süreyi zaman çizelgesindeki yazı klibinden değiştirebilirsin.",
+                        color = VireonMuted,
+                        fontSize = 11.sp
                     )
-                    Text("Bitiş: ${formatTimelineTime(draftEndMs)}", color = VireonText, fontSize = 12.sp)
-                    Slider(
-                        value = draftEndMs.toFloat().coerceIn(0f, totalDurationMs.coerceAtLeast(1L).toFloat()),
-                        onValueChange = { draftEndMs = it.toLong().coerceIn((draftStartMs + 250L).coerceAtMost(totalDurationMs), totalDurationMs) },
-                        valueRange = 0f..totalDurationMs.coerceAtLeast(1L).toFloat()
-                    )
-                    Text("Boyut: ${draftSize.roundToInt()}", color = VireonText, fontSize = 12.sp)
-                    Slider(value = draftSize, onValueChange = { draftSize = it }, valueRange = 12f..64f)
-                    Text("Eğim: ${draftRotation.roundToInt()}°", color = VireonText, fontSize = 12.sp)
-                    Slider(value = draftRotation, onValueChange = { draftRotation = it }, valueRange = -180f..180f)
-                    Text("Konum için önizlemedeki yazıyı parmağınla sürükle.", color = VireonMuted, fontSize = 11.sp)
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
                         val clean = textDraft.trim()
-                        val start = draftStartMs.coerceIn(0L, totalDurationMs)
-                        val end = draftEndMs.coerceIn((start + 250L).coerceAtMost(totalDurationMs), totalDurationMs)
-                        if (clean.isNotEmpty() && end > start) {
+                        if (clean.isNotEmpty() && totalDurationMs >= 250L) {
                             val existingId = editingTextId
                             if (existingId == null) {
-                                val overlay = TextOverlay(nextTextId++, clean, start, end, draftX, draftY, draftSize, draftRotation)
+                                val start = playheadMs.coerceIn(0L, (totalDurationMs - 250L).coerceAtLeast(0L))
+                                val end = (start + 3_000L).coerceAtMost(totalDurationMs)
+                                val overlay = TextOverlay(nextTextId++, clean, start, end)
                                 textOverlays = textOverlays + overlay
                                 selectedTextId = overlay.id
+                                selectedAudioId = null
+                                selectedVisualId = null
                             } else {
-                                updateText(existingId) {
-                                    it.copy(value = clean, startMs = start, endMs = end, x = draftX, y = draftY, sizeSp = draftSize, rotationDegrees = draftRotation)
-                                }
+                                updateText(existingId) { it.copy(value = clean) }
                             }
                             showTextDialog = false
                         }
@@ -855,10 +874,10 @@ private fun VideoPreview(
     activeTexts: List<TextOverlay>,
     isPlaying: Boolean,
     onTogglePlayback: () -> Unit,
-    onMoveText: (Long, Float, Float) -> Unit,
+    onTransformText: (Long, Float, Float, Float, Float) -> Unit,
+    onSelectText: (Long) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val density = LocalDensity.current
     BoxWithConstraints(modifier.clip(RoundedCornerShape(16.dp)).background(Color.Black)) {
         if (activeVisual?.kind == VisualKind.IMAGE && activeVisual.thumbnail != null) {
             ComposeImage(activeVisual.thumbnail.asImageBitmap(), contentDescription = activeVisual.name, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
@@ -887,19 +906,23 @@ private fun VideoPreview(
                     .align(Alignment.Center)
                     .offset(x = maxWidth * (overlay.x - 0.5f), y = maxHeight * (overlay.y - 0.5f))
                     .graphicsLayer { rotationZ = overlay.rotationDegrees }
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(Color.Black.copy(alpha = 0.52f))
-                    .padding(horizontal = 10.dp, vertical = 6.dp)
-                    .pointerInput(overlay.id, overlay.x, overlay.y, maxWidth, maxHeight) {
-                        detectDragGestures { change, drag ->
-                            change.consume()
-                            val widthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
-                            val heightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
-                            onMoveText(
-                                overlay.id,
-                                (overlay.x + drag.x / widthPx).coerceIn(0.05f, 0.95f),
-                                (overlay.y + drag.y / heightPx).coerceIn(0.05f, 0.95f)
-                            )
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color.Black.copy(alpha = 0.58f))
+                    .padding(horizontal = 18.dp, vertical = 12.dp)
+                    .pointerInput(overlay.id) {
+                        var currentX = overlay.x
+                        var currentY = overlay.y
+                        var currentSize = overlay.sizeSp
+                        var currentRotation = overlay.rotationDegrees
+                        val widthPx = size.width.toFloat().coerceAtLeast(1f)
+                        val heightPx = size.height.toFloat().coerceAtLeast(1f)
+                        detectTransformGestures { _, pan, zoomChange, rotationChange ->
+                            currentX = (currentX + pan.x / widthPx).coerceIn(0.05f, 0.95f)
+                            currentY = (currentY + pan.y / heightPx).coerceIn(0.05f, 0.95f)
+                            currentSize = (currentSize * zoomChange).coerceIn(12f, 96f)
+                            currentRotation = (currentRotation + rotationChange).coerceIn(-180f, 180f)
+                            onSelectText(overlay.id)
+                            onTransformText(overlay.id, currentX, currentY, currentSize, currentRotation)
                         }
                     }
             )
@@ -940,6 +963,10 @@ private fun TimelinePanel(
     onEditText: (Long) -> Unit,
     onMoveAudio: (Long, Long) -> Unit,
     onMoveText: (Long, Long) -> Unit,
+    onResizeAudioStart: (Long, Long) -> Unit,
+    onResizeAudioEnd: (Long, Long) -> Unit,
+    onResizeTextStart: (Long, Long) -> Unit,
+    onResizeTextEnd: (Long, Long) -> Unit,
     canPreviousCut: Boolean,
     canNextCut: Boolean,
     onPreviousCut: () -> Unit,
@@ -963,8 +990,9 @@ private fun TimelinePanel(
     val location = locateVisual(visualClips, playheadMs)
     val selectedLocalMs = if (location != null && visualClips.getOrNull(location.index)?.id == selectedVisualId) location.localMs else 0L
     val canCut = selectedVisual != null && selectedLocalMs >= 500L && selectedLocalMs <= selectedVisual.durationMs - 500L
-    val pxPerMs = timelineScale(totalDurationMs)
-    val timelineWidth = (totalDurationMs.coerceAtLeast(1L) * pxPerMs).coerceAtLeast(320f).dp
+    var zoom by remember { mutableStateOf(1f) }
+    val pxPerMs = timelineScale(totalDurationMs) * zoom
+    val timelineWidth = (totalDurationMs.coerceAtLeast(1L) * pxPerMs).coerceAtLeast(320f * zoom).dp
     val density = LocalDensity.current
     val horizontalScroll = rememberScrollState()
 
@@ -974,8 +1002,11 @@ private fun TimelinePanel(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Zaman çizelgesi", color = VireonText, fontSize = 13.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.weight(1f))
-            Text("${formatTimelineTime(playheadMs)} / ${formatTimelineTime(totalDurationMs)}", color = VireonMuted, fontSize = 10.sp)
+            TimelineAction("−", zoom > 0.5f) { zoom = (zoom - 0.25f).coerceAtLeast(0.5f) }
+            TimelineAction("1×", zoom != 1f) { zoom = 1f }
+            TimelineAction("+", zoom < 3f) { zoom = (zoom + 0.25f).coerceAtMost(3f) }
         }
+        Text("${formatTimelineTime(playheadMs)} / ${formatTimelineTime(totalDurationMs)}", color = VireonMuted, fontSize = 10.sp)
         Spacer(Modifier.height(5.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
             TimelineAction("◀ Kesit", canPreviousCut, onPreviousCut)
@@ -1010,7 +1041,7 @@ private fun TimelinePanel(
                 Text("Seçili yazı: ${selectedText.value}", color = VireonText, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                 TimelineAction("Düzenle", true) { onEditText(selectedText.id) }
             }
-            Text("${formatTimelineTime(selectedText.startMs)} – ${formatTimelineTime(selectedText.endMs)}  •  Önizlemede yazıyı sürükleyerek konumlandır", color = VireonMuted, fontSize = 10.sp)
+            Text("${formatTimelineTime(selectedText.startMs)} – ${formatTimelineTime(selectedText.endMs)}  •  Süreyi yazı klibinin kenarlarından ayarla", color = VireonMuted, fontSize = 10.sp)
         }
 
         Spacer(Modifier.height(4.dp))
@@ -1083,7 +1114,9 @@ private fun TimelinePanel(
                     pxPerMs = pxPerMs,
                     density = density.density,
                     onSelect = onSelectAudio,
-                    onMove = onMoveAudio
+                    onMove = onMoveAudio,
+                    onResizeStart = onResizeAudioStart,
+                    onResizeEnd = onResizeAudioEnd
                 )
                 Spacer(Modifier.height(7.dp))
                 Text("YAZI KATMANI  •  Bağımsız konumlandır", color = VireonMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold)
@@ -1097,7 +1130,9 @@ private fun TimelinePanel(
                     pxPerMs = pxPerMs,
                     density = density.density,
                     onSelect = onSelectText,
-                    onMove = onMoveText
+                    onMove = onMoveText,
+                    onResizeStart = onResizeTextStart,
+                    onResizeEnd = onResizeTextEnd
                 )
             }
         }
@@ -1116,33 +1151,89 @@ private fun AudioTimelineLane(
     pxPerMs: Float,
     density: Float,
     onSelect: (Long) -> Unit,
-    onMove: (Long, Long) -> Unit
+    onMove: (Long, Long) -> Unit,
+    onResizeStart: (Long, Long) -> Unit,
+    onResizeEnd: (Long, Long) -> Unit
 ) {
-    Box(Modifier.width(totalWidth).height(46.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xFF2B2042))) {
+    Box(Modifier.width(totalWidth).height(54.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xFF2B2042))) {
         clips.forEach { clip ->
-            val x = (clip.timelineStartMs * pxPerMs).dp
-            val width = (clip.durationMs * pxPerMs).coerceAtLeast(30f).dp
+            var moveOffsetPx by remember(clip.id) { mutableStateOf(0f) }
+            var leftResizePx by remember(clip.id) { mutableStateOf(0f) }
+            var rightResizePx by remember(clip.id) { mutableStateOf(0f) }
+            val x = (clip.timelineStartMs * pxPerMs).dp + (leftResizePx / density).dp
+            val baseWidth = (clip.durationMs * pxPerMs).coerceAtLeast(42f)
+            val visibleWidth = (baseWidth + (rightResizePx - leftResizePx) / density).coerceAtLeast(36f).dp
             Box(
-                Modifier.offset(x = x).width(width).fillMaxHeight().padding(end = 2.dp)
-                    .clip(RoundedCornerShape(5.dp))
-                    .border(if (clip.id == selectedId) 2.dp else 1.dp, if (clip.id == selectedId) VireonBlue else VireonPurple, RoundedCornerShape(5.dp))
-                    .background(VireonPurple.copy(alpha = 0.78f))
+                Modifier.offset(x = x).width(visibleWidth).fillMaxHeight().padding(vertical = 2.dp, horizontal = 1.dp)
+                    .graphicsLayer { translationX = moveOffsetPx }
+                    .clip(RoundedCornerShape(6.dp))
+                    .border(if (clip.id == selectedId) 2.dp else 1.dp, if (clip.id == selectedId) VireonBlue else VireonPurple, RoundedCornerShape(6.dp))
+                    .background(VireonPurple.copy(alpha = 0.82f))
                     .clickable { onSelect(clip.id) }
-                    .pointerInput(clip.id, pxPerMs) {
-                        var draggedStartMs = clip.timelineStartMs
-                        detectDragGestures(onDragStart = { draggedStartMs = clip.timelineStartMs; onSelect(clip.id) }) { change, drag ->
-                            change.consume()
-                            val deltaMs = (drag.x / density / pxPerMs).toLong()
-                            draggedStartMs = (draggedStartMs + deltaMs).coerceAtLeast(0L)
-                            onMove(clip.id, draggedStartMs)
-                        }
+                    .pointerInput(clip.id, clip.timelineStartMs, clip.sourceStartMs, clip.sourceEndMs, pxPerMs, density) {
+                        var dragPx = 0f
+                        detectDragGestures(
+                            onDragStart = { dragPx = 0f; onSelect(clip.id) },
+                            onDragEnd = {
+                                val deltaMs = (dragPx / density / pxPerMs).roundToLong()
+                                onMove(clip.id, clip.timelineStartMs + deltaMs)
+                                moveOffsetPx = 0f
+                            },
+                            onDragCancel = { moveOffsetPx = 0f },
+                            onDrag = { change, amount ->
+                                change.consume()
+                                dragPx += amount.x
+                                moveOffsetPx = dragPx
+                            }
+                        )
                     },
-                contentAlignment = Alignment.CenterStart
+                contentAlignment = Alignment.Center
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 5.dp)) {
-                    Icon(Icons.Default.MusicNote, contentDescription = null, tint = Color.White, modifier = Modifier.size(12.dp))
-                    Spacer(Modifier.width(3.dp))
-                    Text(clip.name, color = Color.White, fontSize = 8.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 15.dp)
+                ) {
+                    Icon(Icons.Default.MusicNote, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(clip.name, color = Color.White, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Box(
+                    Modifier.align(Alignment.CenterStart).width(12.dp).fillMaxHeight()
+                        .background(Color.White.copy(alpha = 0.16f))
+                        .pointerInput(clip.id, clip.timelineStartMs, clip.sourceStartMs, clip.sourceEndMs, pxPerMs, density) {
+                            detectDragGestures(
+                                onDragStart = { leftResizePx = 0f; onSelect(clip.id) },
+                                onDragEnd = {
+                                    val deltaMs = (leftResizePx / density / pxPerMs).roundToLong()
+                                    onResizeStart(clip.id, clip.timelineStartMs + deltaMs)
+                                    leftResizePx = 0f
+                                },
+                                onDragCancel = { leftResizePx = 0f },
+                                onDrag = { change, amount -> change.consume(); leftResizePx += amount.x }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(Modifier.width(3.dp).fillMaxHeight(0.55f).clip(RoundedCornerShape(2.dp)).background(Color.White))
+                }
+                Box(
+                    Modifier.align(Alignment.CenterEnd).width(12.dp).fillMaxHeight()
+                        .background(Color.White.copy(alpha = 0.16f))
+                        .pointerInput(clip.id, clip.timelineStartMs, clip.sourceStartMs, clip.sourceEndMs, pxPerMs, density) {
+                            detectDragGestures(
+                                onDragStart = { rightResizePx = 0f; onSelect(clip.id) },
+                                onDragEnd = {
+                                    val deltaMs = (rightResizePx / density / pxPerMs).roundToLong()
+                                    onResizeEnd(clip.id, clip.timelineEndMs + deltaMs)
+                                    rightResizePx = 0f
+                                },
+                                onDragCancel = { rightResizePx = 0f },
+                                onDrag = { change, amount -> change.consume(); rightResizePx += amount.x }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(Modifier.width(3.dp).fillMaxHeight(0.55f).clip(RoundedCornerShape(2.dp)).background(Color.White))
                 }
             }
         }
@@ -1160,30 +1251,91 @@ private fun TextTimelineLane(
     pxPerMs: Float,
     density: Float,
     onSelect: (Long) -> Unit,
-    onMove: (Long, Long) -> Unit
+    onMove: (Long, Long) -> Unit,
+    onResizeStart: (Long, Long) -> Unit,
+    onResizeEnd: (Long, Long) -> Unit
 ) {
-    Box(Modifier.width(totalWidth).height(44.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xFF1C302A))) {
+    Box(Modifier.width(totalWidth).height(52.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xFF1C302A))) {
         clips.forEach { clip ->
-            val x = (clip.startMs * pxPerMs).dp
-            val width = ((clip.endMs - clip.startMs) * pxPerMs).coerceAtLeast(36f).dp
+            var moveOffsetPx by remember(clip.id) { mutableStateOf(0f) }
+            var leftResizePx by remember(clip.id) { mutableStateOf(0f) }
+            var rightResizePx by remember(clip.id) { mutableStateOf(0f) }
+            val x = (clip.startMs * pxPerMs).dp + (leftResizePx / density).dp
+            val durationMs = clip.endMs - clip.startMs
+            val baseWidth = (durationMs * pxPerMs).coerceAtLeast(42f)
+            val visibleWidth = (baseWidth + (rightResizePx - leftResizePx) / density).coerceAtLeast(36f).dp
             Box(
-                Modifier.offset(x = x).width(width).fillMaxHeight().padding(end = 2.dp)
-                    .clip(RoundedCornerShape(5.dp))
-                    .border(if (clip.id == selectedId) 2.dp else 1.dp, if (clip.id == selectedId) VireonBlue else VireonGreen, RoundedCornerShape(5.dp))
-                    .background(VireonGreen.copy(alpha = 0.76f))
+                Modifier.offset(x = x).width(visibleWidth).fillMaxHeight().padding(vertical = 2.dp, horizontal = 1.dp)
+                    .graphicsLayer { translationX = moveOffsetPx }
+                    .clip(RoundedCornerShape(6.dp))
+                    .border(if (clip.id == selectedId) 2.dp else 1.dp, if (clip.id == selectedId) VireonBlue else VireonGreen, RoundedCornerShape(6.dp))
+                    .background(VireonGreen.copy(alpha = 0.82f))
                     .clickable { onSelect(clip.id) }
-                    .pointerInput(clip.id, pxPerMs) {
-                        var draggedStartMs = clip.startMs
-                        detectDragGestures(onDragStart = { draggedStartMs = clip.startMs; onSelect(clip.id) }) { change, drag ->
-                            change.consume()
-                            val deltaMs = (drag.x / density / pxPerMs).toLong()
-                            draggedStartMs = (draggedStartMs + deltaMs).coerceAtLeast(0L)
-                            onMove(clip.id, draggedStartMs)
-                        }
+                    .pointerInput(clip.id, clip.startMs, clip.endMs, pxPerMs, density) {
+                        var dragPx = 0f
+                        detectDragGestures(
+                            onDragStart = { dragPx = 0f; onSelect(clip.id) },
+                            onDragEnd = {
+                                val deltaMs = (dragPx / density / pxPerMs).roundToLong()
+                                onMove(clip.id, clip.startMs + deltaMs)
+                                moveOffsetPx = 0f
+                            },
+                            onDragCancel = { moveOffsetPx = 0f },
+                            onDrag = { change, amount ->
+                                change.consume()
+                                dragPx += amount.x
+                                moveOffsetPx = dragPx
+                            }
+                        )
                     },
-                contentAlignment = Alignment.CenterStart
+                contentAlignment = Alignment.Center
             ) {
-                Text(clip.value, color = Color.White, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 6.dp))
+                Text(
+                    clip.value,
+                    color = Color.White,
+                    fontSize = 9.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 15.dp)
+                )
+                Box(
+                    Modifier.align(Alignment.CenterStart).width(12.dp).fillMaxHeight()
+                        .background(Color.White.copy(alpha = 0.16f))
+                        .pointerInput(clip.id, clip.startMs, clip.endMs, pxPerMs, density) {
+                            detectDragGestures(
+                                onDragStart = { leftResizePx = 0f; onSelect(clip.id) },
+                                onDragEnd = {
+                                    val deltaMs = (leftResizePx / density / pxPerMs).roundToLong()
+                                    onResizeStart(clip.id, clip.startMs + deltaMs)
+                                    leftResizePx = 0f
+                                },
+                                onDragCancel = { leftResizePx = 0f },
+                                onDrag = { change, amount -> change.consume(); leftResizePx += amount.x }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(Modifier.width(3.dp).fillMaxHeight(0.55f).clip(RoundedCornerShape(2.dp)).background(Color.White))
+                }
+                Box(
+                    Modifier.align(Alignment.CenterEnd).width(12.dp).fillMaxHeight()
+                        .background(Color.White.copy(alpha = 0.16f))
+                        .pointerInput(clip.id, clip.startMs, clip.endMs, pxPerMs, density) {
+                            detectDragGestures(
+                                onDragStart = { rightResizePx = 0f; onSelect(clip.id) },
+                                onDragEnd = {
+                                    val deltaMs = (rightResizePx / density / pxPerMs).roundToLong()
+                                    onResizeEnd(clip.id, clip.endMs + deltaMs)
+                                    rightResizePx = 0f
+                                },
+                                onDragCancel = { rightResizePx = 0f },
+                                onDrag = { change, amount -> change.consume(); rightResizePx += amount.x }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(Modifier.width(3.dp).fillMaxHeight(0.55f).clip(RoundedCornerShape(2.dp)).background(Color.White))
+                }
             }
         }
         TimelinePlayhead(playheadMs, totalDurationMs, totalWidth)
