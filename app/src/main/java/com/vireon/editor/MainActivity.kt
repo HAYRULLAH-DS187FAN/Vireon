@@ -291,6 +291,8 @@ private fun EditorScreen(
     var nextAudioId by remember { mutableStateOf(1L) }
     var nextTextId by remember { mutableStateOf(1L) }
 
+    val totalDurationMs = visualClips.sumOf { it.durationMs }
+
     var showTextDialog by remember { mutableStateOf(false) }
     var editingTextId by remember { mutableStateOf<Long?>(null) }
     var textDraft by remember { mutableStateOf("") }
@@ -381,7 +383,6 @@ private fun EditorScreen(
         }
     }
 
-    val totalDurationMs = visualClips.sumOf { it.durationMs }
     val located = locateVisual(visualClips, playheadMs)
     val activeIndex = located?.index ?: -1
     val activeVisual = visualClips.getOrNull(activeIndex)
