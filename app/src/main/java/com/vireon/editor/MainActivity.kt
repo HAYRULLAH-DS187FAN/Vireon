@@ -1,10 +1,13 @@
 package com.vireon.editor
 
-import android.content.res.Configuration
+import android.content.Context
+import android.database.Cursor
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -12,15 +15,17 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image as ComposeImage
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -29,60 +34,65 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.FolderOpen
-import androidx.compose.material.icons.filled.Layers
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.MusicNote
-import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.TextFields
-import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -98,85 +108,89 @@ import com.vireon.editor.ui.theme.VireonText
 import com.vireon.editor.ui.theme.VireonTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
-private data class TimelineClip(
+private enum class VisualKind { VIDEO, IMAGE }
+
+private data class VisualClip(
     val id: Long,
-    val startMs: Long,
-    val endMs: Long
+    val uri: String,
+    val name: String,
+    val kind: VisualKind,
+    val sourceStartMs: Long = 0L,
+    val sourceEndMs: Long = 0L,
+    val imageDurationMs: Long = 3_000L,
+    val thumbnail: Bitmap? = null
 ) {
     val durationMs: Long
-        get() = (endMs - startMs).coerceAtLeast(0L)
+        get() = if (kind == VisualKind.VIDEO) {
+            (sourceEndMs - sourceStartMs).coerceAtLeast(0L)
+        } else imageDurationMs.coerceAtLeast(250L)
 }
 
-private data class TimelineText(
+private data class AudioClip(
+    val id: Long,
+    val uri: String,
+    val name: String,
+    val timelineStartMs: Long,
+    val sourceStartMs: Long,
+    val sourceEndMs: Long,
+    val volume: Float = 1f
+) {
+    val durationMs: Long
+        get() = (sourceEndMs - sourceStartMs).coerceAtLeast(0L)
+    val timelineEndMs: Long
+        get() = timelineStartMs + durationMs
+}
+
+private data class TextOverlay(
     val id: Long,
     val value: String,
     val startMs: Long,
-    val endMs: Long
+    val endMs: Long,
+    val x: Float = 0.5f,
+    val y: Float = 0.72f,
+    val sizeSp: Float = 26f,
+    val rotationDegrees: Float = 0f
 )
 
-private data class TimelineThumbnail(
-    val timeMs: Long,
-    val bitmap: Bitmap
-)
+private data class LocatedClip(val index: Int, val localMs: Long, val timelineStartMs: Long)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent {
-            VireonTheme {
-                VireonApp()
-            }
-        }
+        setContent { VireonTheme { VireonApp() } }
     }
 }
 
 @Composable
 private fun VireonApp() {
-    var selectedVideo by rememberSaveable { mutableStateOf<String?>(null) }
-    var selectedAudioLabel by rememberSaveable { mutableStateOf<String?>(null) }
     val context = LocalContext.current
+    var initialVideoUris by remember { mutableStateOf<List<String>?>(null) }
+    val projectPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(12)
+    ) { uris ->
+        if (uris.isNotEmpty()) initialVideoUris = uris.map(Uri::toString)
+    }
 
-    val videoPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        if (uri != null) {
-            selectedVideo = uri.toString()
-            selectedAudioLabel = null
+    if (initialVideoUris == null) {
+        HomeScreen {
+            projectPicker.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
+            )
         }
-    }
-
-    val audioPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) {
-            selectedAudioLabel = uri.lastPathSegment?.substringAfterLast('/') ?: "Ses dosyası"
-        }
-    }
-
-    val openVideoPicker = {
-        videoPicker.launch(
-            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
-        )
-    }
-
-    if (selectedVideo == null) {
-        HomeScreen(onNewProject = openVideoPicker)
     } else {
         EditorScreen(
-            videoUri = Uri.parse(selectedVideo),
-            audioLabel = selectedAudioLabel,
-            onBack = {
-                selectedVideo = null
-                selectedAudioLabel = null
-            },
-            onAddAudio = { audioPicker.launch(arrayOf("audio/*")) },
+            initialVideoUris = initialVideoUris.orEmpty(),
+            onBack = { initialVideoUris = null },
             onExport = {
                 Toast.makeText(
                     context,
-                    "Dışa aktarma motoru sonraki geliştirme aşamasında eklenecek.",
-                    Toast.LENGTH_SHORT
+                    "Düzenlemeler hazır. Video dışa aktarma motoru sonraki aşamada bağlanacak.",
+                    Toast.LENGTH_LONG
                 ).show()
             }
         )
@@ -193,36 +207,18 @@ private fun HomeScreen(onNewProject: () -> Unit) {
             .padding(horizontal = 22.dp, vertical = 24.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            VireonMark(size = 50.dp)
+            VireonMark(50.dp)
             Spacer(Modifier.width(12.dp))
             Column {
-                Text(
-                    text = "VIREON",
-                    color = VireonText,
-                    fontSize = 23.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    letterSpacing = 2.sp
-                )
+                Text("VIREON", color = VireonText, fontSize = 23.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 2.sp)
                 Text("Create without limits.", color = VireonMuted, fontSize = 12.sp)
             }
         }
-
         Spacer(Modifier.height(34.dp))
-        Text(
-            text = "Fikirlerini\nvideoya dönüştür.",
-            color = VireonText,
-            fontSize = 32.sp,
-            lineHeight = 38.sp,
-            fontWeight = FontWeight.Bold
-        )
+        Text("Fikirlerini\nvideoya dönüştür.", color = VireonText, fontSize = 32.sp, lineHeight = 38.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(10.dp))
-        Text(
-            text = "Düzenle, üret ve paylaş. Kontrol tamamen sende.",
-            color = VireonMuted,
-            fontSize = 14.sp
-        )
+        Text("Düzenle, üret ve paylaş. Kontrol tamamen sende.", color = VireonMuted, fontSize = 14.sp)
         Spacer(Modifier.height(24.dp))
-
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(24.dp),
@@ -231,22 +227,13 @@ private fun HomeScreen(onNewProject: () -> Unit) {
         ) {
             Column(Modifier.padding(20.dp)) {
                 Box(
-                    modifier = Modifier
-                        .size(54.dp)
-                        .clip(RoundedCornerShape(17.dp))
-                        .background(VireonSurfaceElevated),
+                    modifier = Modifier.size(54.dp).clip(RoundedCornerShape(17.dp)).background(VireonSurfaceElevated),
                     contentAlignment = Alignment.Center
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = null, tint = VireonBlue, modifier = Modifier.size(30.dp))
-                }
+                ) { Icon(Icons.Default.Add, contentDescription = null, tint = VireonBlue, modifier = Modifier.size(30.dp)) }
                 Spacer(Modifier.height(16.dp))
                 Text("Yeni bir proje oluştur", color = VireonText, fontSize = 19.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(6.dp))
-                Text(
-                    "Cihazındaki bir videoyu seçerek düzenleme alanını aç.",
-                    color = VireonMuted,
-                    fontSize = 13.sp
-                )
+                Text("Birden fazla videoyu aynı projeye ekleyerek başlayabilirsin.", color = VireonMuted, fontSize = 13.sp)
                 Spacer(Modifier.height(18.dp))
                 Button(
                     onClick = onNewProject,
@@ -254,264 +241,480 @@ private fun HomeScreen(onNewProject: () -> Unit) {
                     shape = RoundedCornerShape(15.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = VireonBlue)
                 ) {
-                    Icon(Icons.Default.VideoLibrary, contentDescription = null)
+                    Icon(Icons.Default.Movie, contentDescription = null)
                     Spacer(Modifier.width(9.dp))
-                    Text("Video seç", fontWeight = FontWeight.Bold)
+                    Text("Videoları seç", fontWeight = FontWeight.Bold)
                 }
             }
         }
-
-        Spacer(Modifier.height(30.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Projelerim", color = VireonText, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.weight(1f))
-            Text("0 proje", color = VireonMuted, fontSize = 12.sp)
-        }
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(24.dp))
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(20.dp),
             colors = CardDefaults.cardColors(containerColor = VireonSurface)
         ) {
             Column(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 28.dp, horizontal = 18.dp),
+                modifier = Modifier.fillMaxWidth().padding(vertical = 24.dp, horizontal = 18.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Icon(Icons.Default.FolderOpen, contentDescription = null, tint = VireonMuted, modifier = Modifier.size(34.dp))
-                Spacer(Modifier.height(10.dp))
-                Text("Henüz proje yok", color = VireonText, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(4.dp))
-                Text("İlk videonu seçerek başlayabilirsin.", color = VireonMuted, fontSize = 12.sp)
+                Icon(Icons.Default.FolderOpen, contentDescription = null, tint = VireonMuted, modifier = Modifier.size(32.dp))
+                Spacer(Modifier.height(8.dp))
+                Text("Projelerim", color = VireonText, fontWeight = FontWeight.SemiBold)
+                Text("Proje kaydetme ve yeniden açma sonraki aşamada.", color = VireonMuted, fontSize = 11.sp)
             }
         }
-
         Spacer(Modifier.height(24.dp))
-        Text(
-            "Ücretsiz  •  Reklamsız  •  Filigransız",
-            modifier = Modifier.fillMaxWidth(),
-            color = VireonMuted,
-            fontSize = 12.sp
-        )
+        Text("Ücretsiz  •  Reklamsız  •  Filigransız", modifier = Modifier.fillMaxWidth(), color = VireonMuted, fontSize = 12.sp)
     }
 }
 
 @Composable
 private fun EditorScreen(
-    videoUri: Uri,
-    audioLabel: String?,
+    initialVideoUris: List<String>,
     onBack: () -> Unit,
-    onAddAudio: () -> Unit,
     onExport: () -> Unit
 ) {
-    val isLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
     val context = LocalContext.current
-    var selectedTool by rememberSaveable { mutableStateOf("Düzenle") }
-    var clips by remember(videoUri) { mutableStateOf(emptyList<TimelineClip>()) }
-    var selectedIndex by remember(videoUri) { mutableStateOf(0) }
-    var currentPositionMs by remember(videoUri) { mutableStateOf(0L) }
-    var sourceDurationMs by remember(videoUri) { mutableStateOf(0L) }
-    var nextClipId by remember(videoUri) { mutableStateOf(2L) }
-    var timelineThumbnails by remember(videoUri) { mutableStateOf(emptyList<TimelineThumbnail>()) }
-    var textOverlays by remember(videoUri) { mutableStateOf(emptyList<TimelineText>()) }
-    var nextTextId by remember(videoUri) { mutableStateOf(1L) }
-    var showTextDialog by rememberSaveable(videoUri) { mutableStateOf(false) }
-    var textDraft by rememberSaveable(videoUri) { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+    val isLandscape = LocalConfiguration.current.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    val density = LocalDensity.current
 
-    val player = remember(videoUri) {
-        ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(videoUri))
-            prepare()
+    var visualClips by remember { mutableStateOf(emptyList<VisualClip>()) }
+    var audioClips by remember { mutableStateOf(emptyList<AudioClip>()) }
+    var textOverlays by remember { mutableStateOf(emptyList<TextOverlay>()) }
+    var playheadMs by remember { mutableStateOf(0L) }
+    var isPlaying by remember { mutableStateOf(false) }
+    var selectedVisualId by remember { mutableStateOf<Long?>(null) }
+    var selectedAudioId by remember { mutableStateOf<Long?>(null) }
+    var selectedTextId by remember { mutableStateOf<Long?>(null) }
+    var nextVisualId by remember { mutableStateOf(1L) }
+    var nextAudioId by remember { mutableStateOf(1L) }
+    var nextTextId by remember { mutableStateOf(1L) }
+
+    var showTextDialog by remember { mutableStateOf(false) }
+    var editingTextId by remember { mutableStateOf<Long?>(null) }
+    var textDraft by remember { mutableStateOf("") }
+    var draftStartMs by remember { mutableStateOf(0L) }
+    var draftEndMs by remember { mutableStateOf(3_000L) }
+    var draftX by remember { mutableStateOf(0.5f) }
+    var draftY by remember { mutableStateOf(0.72f) }
+    var draftSize by remember { mutableStateOf(26f) }
+    var draftRotation by remember { mutableStateOf(0f) }
+
+    val previewPlayer = remember { ExoPlayer.Builder(context).build() }
+    val audioPlayers = remember { mutableMapOf<Long, ExoPlayer>() }
+    DisposableEffect(Unit) {
+        onDispose {
+            previewPlayer.release()
+            audioPlayers.values.forEach { runCatching { it.release() } }
+            audioPlayers.clear()
         }
     }
 
-    DisposableEffect(player) {
-        onDispose { player.release() }
+    val videoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(12)
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            scope.launch {
+                uris.forEach { uri ->
+                    val id = nextVisualId++
+                    val clip = inspectVisual(context, uri, VisualKind.VIDEO, id)
+                    visualClips = visualClips + clip
+                    if (selectedVisualId == null) selectedVisualId = clip.id
+                }
+            }
+        }
+    }
+    val imagePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(12)
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            scope.launch {
+                uris.forEach { uri ->
+                    val id = nextVisualId++
+                    val clip = inspectVisual(context, uri, VisualKind.IMAGE, id)
+                    visualClips = visualClips + clip
+                    selectedVisualId = clip.id
+                }
+            }
+        }
+    }
+    val audioPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            scope.launch {
+                val info = inspectAudio(context, uri)
+                val snappedStart = snapToCut(playheadMs, visualClips, 250L)
+                val start = snappedStart.coerceAtMost((totalDurationMs - 250L).coerceAtLeast(0L))
+                val usableDuration = minOf(info.second, (totalDurationMs - start).coerceAtLeast(0L))
+                if (usableDuration >= 250L) {
+                    val clip = AudioClip(
+                        id = nextAudioId++,
+                        uri = uri.toString(),
+                        name = info.first,
+                        timelineStartMs = start,
+                        sourceStartMs = 0L,
+                        sourceEndMs = usableDuration
+                    )
+                    audioClips = audioClips + clip
+                    selectedAudioId = clip.id
+                    selectedTextId = null
+                } else {
+                    Toast.makeText(context, "Ses dosyasının süresi okunamadı.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
     }
 
-    // Read the source duration and keep the playhead synchronized with the active clip.
-    LaunchedEffect(player) {
-        while (sourceDurationMs <= 0L) {
-            val duration = player.duration
-            if (duration > 0L) {
-                sourceDurationMs = duration
-                clips = listOf(TimelineClip(id = 1L, startMs = 0L, endMs = duration))
-                selectedIndex = 0
+    LaunchedEffect(initialVideoUris) {
+        if (visualClips.isEmpty()) {
+            initialVideoUris.forEach { rawUri ->
+                val id = nextVisualId++
+                val clip = inspectVisual(context, Uri.parse(rawUri), VisualKind.VIDEO, id)
+                visualClips = visualClips + clip
+                if (selectedVisualId == null) selectedVisualId = clip.id
+            }
+        }
+    }
+
+    val totalDurationMs = visualClips.sumOf { it.durationMs }
+    val located = locateVisual(visualClips, playheadMs)
+    val activeIndex = located?.index ?: -1
+    val activeVisual = visualClips.getOrNull(activeIndex)
+    val activeLocalMs = located?.localMs ?: 0L
+    val activeTimelineStartMs = located?.timelineStartMs ?: 0L
+    val selectedVisual = visualClips.firstOrNull { it.id == selectedVisualId }
+    val selectedVisualIndex = visualClips.indexOfFirst { it.id == selectedVisualId }
+    val selectedAudio = audioClips.firstOrNull { it.id == selectedAudioId }
+    val activeTexts = textOverlays.filter { playheadMs >= it.startMs && playheadMs < it.endMs }
+    val activeAudioIds = audioClips.filter { playheadMs >= it.timelineStartMs && playheadMs < it.timelineEndMs }.map { it.id }.toSet()
+
+    fun setTimelinePosition(requested: Long, snap: Boolean = true) {
+        val end = totalDurationMs.coerceAtLeast(0L)
+        val candidate = requested.coerceIn(0L, end)
+        playheadMs = if (snap) snapToCut(candidate, visualClips, 220L) else candidate
+        locateVisual(visualClips, playheadMs)?.let { location ->
+            selectedVisualId = visualClips.getOrNull(location.index)?.id
+        }
+    }
+
+    fun openTextEditor(existing: TextOverlay? = null) {
+        editingTextId = existing?.id
+        textDraft = existing?.value.orEmpty()
+        draftStartMs = existing?.startMs ?: playheadMs.coerceAtMost((totalDurationMs - 250L).coerceAtLeast(0L))
+        draftEndMs = existing?.endMs ?: (draftStartMs + 3_000L).coerceAtMost(totalDurationMs)
+        if (draftEndMs <= draftStartMs) draftEndMs = (draftStartMs + 500L).coerceAtMost(totalDurationMs)
+        draftX = existing?.x ?: 0.5f
+        draftY = existing?.y ?: 0.72f
+        draftSize = existing?.sizeSp ?: 26f
+        draftRotation = existing?.rotationDegrees ?: 0f
+        showTextDialog = true
+    }
+
+    fun appendVisual(uri: Uri, kind: VisualKind) {
+        scope.launch {
+            val id = nextVisualId++
+            val clip = inspectVisual(context, uri, kind, id)
+            visualClips = visualClips + clip
+            selectedVisualId = clip.id
+            selectedAudioId = null
+            selectedTextId = null
+            Toast.makeText(context, if (kind == VisualKind.VIDEO) "Video ana sıraya eklendi." else "Görsel ana sıraya eklendi.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun updateAudio(id: Long, transform: (AudioClip) -> AudioClip) {
+        audioClips = audioClips.map { if (it.id == id) transform(it) else it }
+    }
+
+    fun updateText(id: Long, transform: (TextOverlay) -> TextOverlay) {
+        textOverlays = textOverlays.map { if (it.id == id) transform(it) else it }
+    }
+
+    LaunchedEffect(activeVisual?.id) {
+        val clip = activeVisual
+        if (clip != null && clip.kind == VisualKind.VIDEO) {
+            previewPlayer.pause()
+            previewPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(clip.uri)))
+            previewPlayer.prepare()
+            previewPlayer.seekTo((clip.sourceStartMs + activeLocalMs).coerceAtLeast(0L))
+        } else {
+            previewPlayer.pause()
+        }
+    }
+
+    LaunchedEffect(playheadMs, activeVisual?.id, isPlaying) {
+        if (!isPlaying && activeVisual != null && activeVisual.kind == VisualKind.VIDEO) {
+            previewPlayer.seekTo((activeVisual.sourceStartMs + activeLocalMs).coerceIn(activeVisual.sourceStartMs, activeVisual.sourceEndMs))
+        }
+    }
+
+    LaunchedEffect(audioClips) {
+        val activeIds = audioClips.map { it.id }.toSet()
+        val removedIds = audioPlayers.keys.filter { it !in activeIds }
+        removedIds.forEach { id ->
+            audioPlayers.remove(id)?.let { runCatching { it.release() } }
+        }
+    }
+
+    fun syncAudioPlayers(positionMs: Long, shouldPlay: Boolean) {
+        audioClips.forEach { clip ->
+            val isActive = positionMs >= clip.timelineStartMs && positionMs < clip.timelineEndMs
+            val player = if (isActive) audioPlayers.getOrPut(clip.id) {
+                ExoPlayer.Builder(context).build().apply {
+                    setMediaItem(MediaItem.fromUri(Uri.parse(clip.uri)))
+                    prepare()
+                }
+            } else audioPlayers[clip.id]
+            if (player != null) {
+                player.volume = clip.volume.coerceIn(0f, 1f)
+                if (isActive) {
+                    val expectedSourceMs = clip.sourceStartMs + (positionMs - clip.timelineStartMs)
+                    if (abs(player.currentPosition - expectedSourceMs) > 240L) player.seekTo(expectedSourceMs)
+                    if (shouldPlay) player.play() else player.pause()
+                } else {
+                    player.pause()
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(playheadMs, isPlaying, audioClips) {
+        if (!isPlaying) syncAudioPlayers(playheadMs, false)
+    }
+
+    LaunchedEffect(isPlaying, activeVisual?.id, visualClips, audioClips) {
+        if (!isPlaying) {
+            previewPlayer.pause()
+            syncAudioPlayers(playheadMs, false)
+            return@LaunchedEffect
+        }
+        while (isPlaying) {
+            val clip = activeVisual
+            val clipIndex = activeIndex
+            if (clip == null || clipIndex !in visualClips.indices) {
+                isPlaying = false
                 break
             }
-            delay(100L)
-        }
-
-        while (true) {
-            val activeIndex = player.currentMediaItemIndex
-            if (activeIndex in clips.indices) {
-                selectedIndex = activeIndex
-                currentPositionMs = player.currentPosition.coerceIn(0L, clips[activeIndex].durationMs)
-            }
-            delay(80L)
-        }
-    }
-
-    // Extract lightweight stills off the UI thread for the clip thumbnails.
-    LaunchedEffect(videoUri, sourceDurationMs) {
-        if (sourceDurationMs <= 0L) return@LaunchedEffect
-        timelineThumbnails = emptyList()
-        val extracted = withContext(Dispatchers.IO) {
-            val retriever = MediaMetadataRetriever()
-            try {
-                retriever.setDataSource(context, videoUri)
-                val count = (sourceDurationMs / 1200L).toInt().coerceIn(8, 30)
-                buildList {
-                    for (index in 0 until count) {
-                        val timeMs = (((index + 0.5) / count) * sourceDurationMs)
-                            .toLong().coerceIn(0L, (sourceDurationMs - 1L).coerceAtLeast(0L))
-                        val frame = retriever.getFrameAtTime(
-                            timeMs * 1_000L,
-                            MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-                        )
-                        if (frame != null) {
-                            val thumbnail = Bitmap.createScaledBitmap(frame, 180, 100, true)
-                            if (thumbnail !== frame) frame.recycle()
-                            add(TimelineThumbnail(timeMs, thumbnail))
-                        }
-                    }
+            syncAudioPlayers(playheadMs, true)
+            if (clip.kind == VisualKind.VIDEO) {
+                if (previewPlayer.currentMediaItem == null) {
+                    previewPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(clip.uri)))
+                    previewPlayer.prepare()
+                    previewPlayer.seekTo(clip.sourceStartMs + activeLocalMs)
                 }
-            } catch (_: Exception) {
-                emptyList()
-            } finally {
-                runCatching { retriever.release() }
+                previewPlayer.play()
+                delay(45L)
+                val sourcePosition = previewPlayer.currentPosition.coerceAtLeast(clip.sourceStartMs)
+                val local = (sourcePosition - clip.sourceStartMs).coerceAtLeast(0L)
+                if (local >= clip.durationMs - 70L || previewPlayer.playbackState == Player.STATE_ENDED) {
+                    val nextIndex = clipIndex + 1
+                    if (nextIndex < visualClips.size) {
+                        setTimelinePosition(visualClips.take(nextIndex).sumOf { it.durationMs }, false)
+                    } else {
+                        playheadMs = totalDurationMs
+                        isPlaying = false
+                    }
+                } else {
+                    playheadMs = activeTimelineStartMs + local
+                }
+            } else {
+                previewPlayer.pause()
+                delay(45L)
+                val nextPosition = playheadMs + 45L
+                if (nextPosition >= activeTimelineStartMs + clip.durationMs) {
+                    val nextIndex = clipIndex + 1
+                    if (nextIndex < visualClips.size) {
+                        setTimelinePosition(visualClips.take(nextIndex).sumOf { it.durationMs }, false)
+                    } else {
+                        playheadMs = totalDurationMs
+                        isPlaying = false
+                    }
+                } else {
+                    playheadMs = nextPosition
+                }
             }
         }
-        timelineThumbnails = extracted
     }
 
-    fun applyClips(updatedClips: List<TimelineClip>, targetIndex: Int) {
-        if (updatedClips.isEmpty()) return
-        val safeIndex = targetIndex.coerceIn(updatedClips.indices)
-        clips = updatedClips
-        selectedIndex = safeIndex
-        currentPositionMs = 0L
-        player.pause()
-        val mediaItems = updatedClips.map { clip ->
-            MediaItem.Builder()
-                .setUri(videoUri)
-                .setClippingConfiguration(
-                    MediaItem.ClippingConfiguration.Builder()
-                        .setStartPositionMs(clip.startMs)
-                        .setEndPositionMs(clip.endMs)
-                        .build()
-                )
-                .build()
-        }
-        player.setMediaItems(mediaItems, safeIndex, 0L)
-        player.prepare()
-    }
-
-    fun trimClipStart() {
-        val clip = clips.getOrNull(selectedIndex) ?: return
-        val newStart = clip.startMs + currentPositionMs
-        if (newStart >= clip.endMs - 500L) {
+    fun trimVisualStart() {
+        val index = visualClips.indexOfFirst { it.id == selectedVisualId }
+        if (index < 0) return
+        val clip = visualClips[index]
+        val location = locateVisual(visualClips, playheadMs)
+        val local = if (location?.index == index) location.localMs else 0L
+        if (clip.durationMs - local < 500L) {
             Toast.makeText(context, "Klipte en az yarım saniye kalmalı.", Toast.LENGTH_SHORT).show()
             return
         }
-        val updated = clips.toMutableList()
-        updated[selectedIndex] = clip.copy(startMs = newStart)
-        applyClips(updated, selectedIndex)
+        val updated = visualClips.toMutableList()
+        updated[index] = if (clip.kind == VisualKind.VIDEO) {
+            clip.copy(sourceStartMs = (clip.sourceStartMs + local).coerceAtMost(clip.sourceEndMs - 500L))
+        } else {
+            clip.copy(imageDurationMs = clip.durationMs - local)
+        }
+        visualClips = updated
+        playheadMs = visualClips.take(index).sumOf { it.durationMs }
     }
 
-    fun trimClipEnd() {
-        val clip = clips.getOrNull(selectedIndex) ?: return
-        val newEnd = clip.startMs + currentPositionMs
-        if (newEnd <= clip.startMs + 500L) {
+    fun trimVisualEnd() {
+        val index = visualClips.indexOfFirst { it.id == selectedVisualId }
+        if (index < 0) return
+        val clip = visualClips[index]
+        val location = locateVisual(visualClips, playheadMs)
+        val local = if (location?.index == index) location.localMs else clip.durationMs
+        if (local < 500L) {
             Toast.makeText(context, "Klipte en az yarım saniye kalmalı.", Toast.LENGTH_SHORT).show()
             return
         }
-        val updated = clips.toMutableList()
-        updated[selectedIndex] = clip.copy(endMs = newEnd.coerceAtMost(clip.endMs))
-        applyClips(updated, selectedIndex)
+        val updated = visualClips.toMutableList()
+        updated[index] = if (clip.kind == VisualKind.VIDEO) {
+            clip.copy(sourceEndMs = (clip.sourceStartMs + local).coerceAtLeast(clip.sourceStartMs + 500L))
+        } else {
+            clip.copy(imageDurationMs = local.coerceAtLeast(500L))
+        }
+        visualClips = updated
+        playheadMs = (visualClips.take(index).sumOf { it.durationMs } + updated[index].durationMs).coerceAtMost(totalDurationMs)
     }
 
-    fun splitClip() {
-        val clip = clips.getOrNull(selectedIndex) ?: return
-        val splitAt = clip.startMs + currentPositionMs
-        if (splitAt < clip.startMs + 500L || splitAt > clip.endMs - 500L) {
-            Toast.makeText(context, "İmleci klibin içinde, kenarlardan en az yarım saniye uzağa taşı.", Toast.LENGTH_SHORT).show()
+    fun splitVisual() {
+        val index = visualClips.indexOfFirst { it.id == selectedVisualId }
+        if (index < 0) return
+        val clip = visualClips[index]
+        val location = locateVisual(visualClips, playheadMs)
+        if (location?.index != index) {
+            Toast.makeText(context, "İmleci bölmek istediğin klibin içine taşı.", Toast.LENGTH_SHORT).show()
             return
         }
-        val updated = clips.toMutableList()
-        updated.removeAt(selectedIndex)
-        updated.add(selectedIndex, clip.copy(endMs = splitAt))
-        updated.add(selectedIndex + 1, TimelineClip(nextClipId, splitAt, clip.endMs))
-        nextClipId += 1L
-        applyClips(updated, selectedIndex + 1)
+        val local = location.localMs
+        if (local < 500L || local > clip.durationMs - 500L) {
+            Toast.makeText(context, "Bölme noktası klibin kenarlarından en az yarım saniye içeride olmalı.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val left: VisualClip
+        val right: VisualClip
+        if (clip.kind == VisualKind.VIDEO) {
+            val splitSourceMs = clip.sourceStartMs + local
+            left = clip.copy(sourceEndMs = splitSourceMs)
+            right = clip.copy(id = nextVisualId++, sourceStartMs = splitSourceMs)
+        } else {
+            left = clip.copy(imageDurationMs = local)
+            right = clip.copy(id = nextVisualId++, imageDurationMs = clip.durationMs - local)
+        }
+        val updated = visualClips.toMutableList()
+        updated.removeAt(index)
+        updated.add(index, left)
+        updated.add(index + 1, right)
+        visualClips = updated
+        selectedVisualId = right.id
+        playheadMs = updated.take(index + 1).sumOf { it.durationMs }
     }
 
-    fun moveSelectedClip(offset: Int) {
-        val targetIndex = selectedIndex + offset
-        if (targetIndex !in clips.indices) return
-        val updated = clips.toMutableList()
-        val movingClip = updated.removeAt(selectedIndex)
-        updated.add(targetIndex, movingClip)
-        applyClips(updated, targetIndex)
+    fun moveVisual(offset: Int) {
+        val index = visualClips.indexOfFirst { it.id == selectedVisualId }
+        val target = index + offset
+        if (index !in visualClips.indices || target !in visualClips.indices) return
+        val updated = visualClips.toMutableList()
+        val item = updated.removeAt(index)
+        updated.add(target, item)
+        visualClips = updated
+        selectedVisualId = item.id
+        playheadMs = updated.take(target).sumOf { it.durationMs }
     }
 
-    val timelinePositionMs = clips.take(selectedIndex).sumOf { it.durationMs } + currentPositionMs
-    val totalTimelineDurationMs = clips.sumOf { it.durationMs }
+    fun moveAudio(id: Long, requestedStart: Long) {
+        val clip = audioClips.firstOrNull { it.id == id } ?: return
+        val maxStart = (totalDurationMs - clip.durationMs).coerceAtLeast(0L)
+        val snapped = snapToCut(requestedStart.coerceIn(0L, maxStart), visualClips, 220L)
+        updateAudio(id) { it.copy(timelineStartMs = snapped.coerceIn(0L, maxStart)) }
+    }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(VireonBackground)
-    ) {
+    fun moveText(id: Long, requestedStart: Long) {
+        val overlay = textOverlays.firstOrNull { it.id == id } ?: return
+        val duration = overlay.endMs - overlay.startMs
+        val maxStart = (totalDurationMs - duration).coerceAtLeast(0L)
+        val snapped = snapToCut(requestedStart.coerceIn(0L, maxStart), visualClips, 220L)
+        updateText(id) { it.copy(startMs = snapped, endMs = snapped + duration) }
+    }
+
+    val previousCut = cutBoundaries(visualClips).filter { it < playheadMs }.maxOrNull()
+    val nextCut = cutBoundaries(visualClips).filter { it > playheadMs }.minOrNull()
+
+    Column(Modifier.fillMaxSize().background(VireonBackground)) {
         EditorTopBar(onBack = onBack, onExport = onExport)
-        Row(modifier = Modifier.weight(1f).fillMaxWidth()) {
+        Row(Modifier.weight(1f).fillMaxWidth()) {
             ToolRail(
-                selectedTool = selectedTool,
-                onToolSelected = { selectedTool = it },
-                onAddAudio = onAddAudio,
-                onAddText = {
-                    selectedTool = "Metin"
-                    if (clips.isEmpty()) {
-                        Toast.makeText(context, "Önce videonun yüklenmesini bekle.", Toast.LENGTH_SHORT).show()
-                    } else {
-                        textDraft = ""
-                        showTextDialog = true
-                    }
+                compact = isLandscape,
+                onAddVideo = {
+                    videoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly))
                 },
-                compact = isLandscape
+                onAddImage = {
+                    imagePicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                },
+                onAddAudio = { audioPicker.launch(arrayOf("audio/*")) },
+                onAddText = { if (totalDurationMs > 0L) openTextEditor() else Toast.makeText(context, "Önce bir video veya görsel ekle.", Toast.LENGTH_SHORT).show() }
             )
-            Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
+            Column(Modifier.weight(1f).fillMaxHeight()) {
                 VideoPreview(
-                    player = player,
-                    textOverlays = textOverlays,
-                    timelinePositionMs = timelinePositionMs,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(if (isLandscape) 0.62f else 0.56f)
-                        .padding(start = 8.dp, end = 10.dp, top = 8.dp, bottom = 6.dp)
+                    player = previewPlayer,
+                    activeVisual = activeVisual,
+                    activeTexts = activeTexts,
+                    isPlaying = isPlaying,
+                    onTogglePlayback = { isPlaying = !isPlaying },
+                    onMoveText = { id, x, y -> updateText(id) { it.copy(x = x, y = y) } },
+                    modifier = Modifier.fillMaxWidth()
+                        .weight(if (isLandscape) 0.56f else 0.46f)
+                        .padding(start = 8.dp, end = 10.dp, top = 8.dp, bottom = 5.dp)
                 )
+
                 TimelinePanel(
-                    audioLabel = audioLabel,
-                    clips = clips,
-                    selectedIndex = selectedIndex,
-                    currentPositionMs = currentPositionMs,
-                    thumbnails = timelineThumbnails,
+                    visualClips = visualClips,
+                    audioClips = audioClips,
                     textOverlays = textOverlays,
-                    onScrub = { index, positionMs ->
-                        if (index in clips.indices) {
-                            player.pause()
-                            selectedIndex = index
-                            currentPositionMs = positionMs.coerceIn(0L, clips[index].durationMs)
-                            player.seekTo(index, currentPositionMs)
-                        }
+                    totalDurationMs = totalDurationMs,
+                    playheadMs = playheadMs,
+                    selectedVisualId = selectedVisualId,
+                    selectedAudioId = selectedAudioId,
+                    selectedTextId = selectedTextId,
+                    onScrub = { setTimelinePosition(it) },
+                    onSelectVisual = { id ->
+                        selectedVisualId = id
+                        selectedAudioId = null
+                        selectedTextId = null
+                        val index = visualClips.indexOfFirst { it.id == id }
+                        if (index >= 0) setTimelinePosition(visualClips.take(index).sumOf { it.durationMs }, false)
                     },
-                    onSplit = ::splitClip,
-                    onTrimStart = ::trimClipStart,
-                    onTrimEnd = ::trimClipEnd,
-                    onMoveLeft = { moveSelectedClip(-1) },
-                    onMoveRight = { moveSelectedClip(1) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(if (isLandscape) 0.38f else 0.44f)
+                    onSelectAudio = { id -> selectedAudioId = id; selectedTextId = null; selectedVisualId = null },
+                    onSelectText = { id ->
+                        selectedTextId = id
+                        selectedAudioId = null
+                        selectedVisualId = null
+                    },
+                    onEditText = { id -> openTextEditor(textOverlays.firstOrNull { it.id == id }) },
+                    onMoveAudio = ::moveAudio,
+                    onMoveText = ::moveText,
+                    canPreviousCut = previousCut != null,
+                    canNextCut = nextCut != null,
+                    onPreviousCut = { previousCut?.let { setTimelinePosition(it, false) } },
+                    onNextCut = { nextCut?.let { setTimelinePosition(it, false) } },
+                    onSplit = ::splitVisual,
+                    onTrimVisualStart = ::trimVisualStart,
+                    onTrimVisualEnd = ::trimVisualEnd,
+                    onMoveVisualLeft = { moveVisual(-1) },
+                    onMoveVisualRight = { moveVisual(1) },
+                    onRemoveAudio = { id ->
+                        audioClips = audioClips.filterNot { it.id == id }
+                        selectedAudioId = null
+                    },
+                    onTrimAudioStart = { id -> updateAudio(id) { it.copy(sourceStartMs = (it.sourceStartMs + 500L).coerceAtMost(it.sourceEndMs - 250L)) } },
+                    onTrimAudioEnd = { id -> updateAudio(id) { it.copy(sourceEndMs = (it.sourceEndMs - 500L).coerceAtLeast(it.sourceStartMs + 250L)) } },
+                    onVolumeChange = { id, value -> updateAudio(id) { it.copy(volume = value) } },
+                    onImageDurationChange = { id, value -> visualClips = visualClips.map { if (it.id == id && it.kind == VisualKind.IMAGE) it.copy(imageDurationMs = value.toLong()) else it } },
+                    modifier = Modifier.fillMaxWidth().weight(if (isLandscape) 0.44f else 0.54f)
                 )
             }
         }
@@ -520,71 +723,92 @@ private fun EditorScreen(
     if (showTextDialog) {
         AlertDialog(
             onDismissRequest = { showTextDialog = false },
-            title = { Text("Videoya yazı ekle") },
+            title = { Text(if (editingTextId == null) "Yazı ekle" else "Yazıyı düzenle") },
             text = {
-                Column {
-                    Text(
-                        "Yazı, zaman çizelgesindeki imlecin bulunduğu noktadan itibaren 3 saniye görünür.",
-                        color = VireonMuted,
-                        fontSize = 12.sp
-                    )
-                    Spacer(Modifier.height(10.dp))
+                Column(Modifier.height(420.dp).verticalScroll(rememberScrollState())) {
                     OutlinedTextField(
                         value = textDraft,
                         onValueChange = { textDraft = it.take(120) },
                         label = { Text("Yazı") },
-                        placeholder = { Text("Buraya yaz...") },
+                        placeholder = { Text("Videoda görünecek metin") },
                         minLines = 2,
                         maxLines = 4,
                         modifier = Modifier.fillMaxWidth()
                     )
+                    Spacer(Modifier.height(12.dp))
+                    Text("Başlangıç: ${formatTimelineTime(draftStartMs)}", color = VireonText, fontSize = 12.sp)
+                    Slider(
+                        value = draftStartMs.toFloat().coerceIn(0f, totalDurationMs.coerceAtLeast(1L).toFloat()),
+                        onValueChange = { value ->
+                            draftStartMs = value.toLong().coerceAtMost((totalDurationMs - 250L).coerceAtLeast(0L))
+                            if (draftEndMs <= draftStartMs) draftEndMs = (draftStartMs + 250L).coerceAtMost(totalDurationMs)
+                        },
+                        valueRange = 0f..totalDurationMs.coerceAtLeast(1L).toFloat()
+                    )
+                    Text("Bitiş: ${formatTimelineTime(draftEndMs)}", color = VireonText, fontSize = 12.sp)
+                    Slider(
+                        value = draftEndMs.toFloat().coerceIn(0f, totalDurationMs.coerceAtLeast(1L).toFloat()),
+                        onValueChange = { draftEndMs = it.toLong().coerceIn((draftStartMs + 250L).coerceAtMost(totalDurationMs), totalDurationMs) },
+                        valueRange = 0f..totalDurationMs.coerceAtLeast(1L).toFloat()
+                    )
+                    Text("Boyut: ${draftSize.roundToInt()}", color = VireonText, fontSize = 12.sp)
+                    Slider(value = draftSize, onValueChange = { draftSize = it }, valueRange = 12f..64f)
+                    Text("Eğim: ${draftRotation.roundToInt()}°", color = VireonText, fontSize = 12.sp)
+                    Slider(value = draftRotation, onValueChange = { draftRotation = it }, valueRange = -180f..180f)
+                    Text("Konum için önizlemedeki yazıyı parmağınla sürükle.", color = VireonMuted, fontSize = 11.sp)
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        val cleanText = textDraft.trim()
-                        if (cleanText.isNotEmpty() && totalTimelineDurationMs > 0L) {
-                            val start = timelinePositionMs.coerceIn(
-                                0L,
-                                (totalTimelineDurationMs - 500L).coerceAtLeast(0L)
-                            )
-                            val end = (start + 3_000L).coerceAtMost(totalTimelineDurationMs)
-                            textOverlays = textOverlays + TimelineText(nextTextId, cleanText, start, end)
-                            nextTextId += 1L
+                        val clean = textDraft.trim()
+                        val start = draftStartMs.coerceIn(0L, totalDurationMs)
+                        val end = draftEndMs.coerceIn((start + 250L).coerceAtMost(totalDurationMs), totalDurationMs)
+                        if (clean.isNotEmpty() && end > start) {
+                            val existingId = editingTextId
+                            if (existingId == null) {
+                                val overlay = TextOverlay(nextTextId++, clean, start, end, draftX, draftY, draftSize, draftRotation)
+                                textOverlays = textOverlays + overlay
+                                selectedTextId = overlay.id
+                            } else {
+                                updateText(existingId) {
+                                    it.copy(value = clean, startMs = start, endMs = end, x = draftX, y = draftY, sizeSp = draftSize, rotationDegrees = draftRotation)
+                                }
+                            }
                             showTextDialog = false
-                            textDraft = ""
-                            Toast.makeText(context, "Yazı zaman çizelgesine eklendi.", Toast.LENGTH_SHORT).show()
                         }
                     },
-                    enabled = textDraft.isNotBlank() && totalTimelineDurationMs > 0L
-                ) { Text("Ekle") }
+                    enabled = textDraft.isNotBlank() && totalDurationMs >= 250L
+                ) { Text("Kaydet") }
             },
             dismissButton = {
-                OutlinedButton(onClick = { showTextDialog = false }) { Text("Vazgeç") }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (editingTextId != null) {
+                        TextButton(onClick = {
+                            textOverlays = textOverlays.filterNot { it.id == editingTextId }
+                            selectedTextId = null
+                            showTextDialog = false
+                        }) { Text("Sil") }
+                    }
+                    TextButton(onClick = { showTextDialog = false }) { Text("Vazgeç") }
+                }
             }
         )
     }
 }
+
 @Composable
 private fun EditorTopBar(onBack: () -> Unit, onExport: () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth().height(58.dp).padding(horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        IconButton(onClick = onBack) {
-            Icon(Icons.Default.ArrowBack, contentDescription = "Geri", tint = VireonText)
-        }
-        Column(modifier = Modifier.weight(1f)) {
+        IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "Geri", tint = VireonText) }
+        Column(Modifier.weight(1f)) {
             Text("Yeni düzenleme", color = VireonText, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-            Text("Vireon 0.1.0", color = VireonMuted, fontSize = 10.sp)
+            Text("Vireon 0.3.0", color = VireonMuted, fontSize = 10.sp)
         }
-        Button(
-            onClick = onExport,
-            shape = RoundedCornerShape(12.dp),
-            contentPadding = ButtonDefaults.ContentPadding,
-            colors = ButtonDefaults.buttonColors(containerColor = VireonBlue)
-        ) {
+        Button(onClick = onExport, shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = VireonBlue)) {
             Text("Dışa aktar", fontSize = 12.sp, fontWeight = FontWeight.Bold)
         }
     }
@@ -592,57 +816,32 @@ private fun EditorTopBar(onBack: () -> Unit, onExport: () -> Unit) {
 
 @Composable
 private fun ToolRail(
-    selectedTool: String,
-    onToolSelected: (String) -> Unit,
+    compact: Boolean,
+    onAddVideo: () -> Unit,
+    onAddImage: () -> Unit,
     onAddAudio: () -> Unit,
-    onAddText: () -> Unit,
-    compact: Boolean
+    onAddText: () -> Unit
 ) {
-    val tools = listOf(
-        Triple("Düzenle", Icons.Default.ContentCut, { onToolSelected("Düzenle") }),
-        Triple("Ses", Icons.Default.MusicNote, onAddAudio),
-        Triple("Metin", Icons.Default.TextFields, onAddText),
-        Triple("Efekt", Icons.Default.AutoAwesome, { onToolSelected("Efekt") }),
-        Triple("Hız", Icons.Default.Speed, { onToolSelected("Hız") }),
-        Triple("Renk", Icons.Default.Tune, { onToolSelected("Renk") }),
-        Triple("Katman", Icons.Default.Layers, { onToolSelected("Katman") })
+    val entries = listOf(
+        Triple("Video +", Icons.Default.Movie, onAddVideo),
+        Triple("Görsel +", Icons.Default.Image, onAddImage),
+        Triple("Ses +", Icons.Default.MusicNote, onAddAudio),
+        Triple("Metin", Icons.Default.TextFields, onAddText)
     )
-
     Column(
-        modifier = Modifier
-            .width(if (compact) 64.dp else 72.dp)
-            .fillMaxHeight()
-            .background(VireonSurface)
-            .verticalScroll(rememberScrollState())
-            .padding(vertical = 8.dp, horizontal = 4.dp),
+        modifier = Modifier.width(if (compact) 62.dp else 70.dp).fillMaxHeight()
+            .background(VireonSurface).verticalScroll(rememberScrollState()).padding(vertical = 7.dp, horizontal = 4.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(5.dp)
+        verticalArrangement = Arrangement.spacedBy(7.dp)
     ) {
-        tools.forEach { (label, icon, action) ->
-            val selected = selectedTool == label
+        entries.forEach { (label, icon, action) ->
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(if (selected) VireonSurfaceElevated else Color.Transparent)
-                    .padding(vertical = 8.dp),
+                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(11.dp)).clickable { action() }.padding(vertical = 8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                IconButton(onClick = action, modifier = Modifier.size(38.dp)) {
-                    Icon(
-                        imageVector = icon,
-                        contentDescription = label,
-                        tint = if (selected) VireonBlue else VireonMuted,
-                        modifier = Modifier.size(21.dp)
-                    )
-                }
-                Text(
-                    text = label,
-                    color = if (selected) VireonText else VireonMuted,
-                    fontSize = 9.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Icon(icon, contentDescription = label, tint = VireonBlue, modifier = Modifier.size(23.dp))
+                Spacer(Modifier.height(4.dp))
+                Text(label, color = VireonText, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
     }
@@ -651,309 +850,494 @@ private fun ToolRail(
 @Composable
 private fun VideoPreview(
     player: ExoPlayer,
-    textOverlays: List<TimelineText>,
-    timelinePositionMs: Long,
+    activeVisual: VisualClip?,
+    activeTexts: List<TextOverlay>,
+    isPlaying: Boolean,
+    onTogglePlayback: () -> Unit,
+    onMoveText: (Long, Float, Float) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val activeText = textOverlays.lastOrNull {
-        timelinePositionMs >= it.startMs && timelinePositionMs < it.endMs
-    }
-    Box(modifier = modifier.clip(RoundedCornerShape(16.dp)).background(Color.Black)) {
-        AndroidView(
-            modifier = Modifier.fillMaxSize(),
-            factory = { viewContext ->
-                PlayerView(viewContext).apply {
-                    useController = true
-                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                    this.player = player
-                }
-            },
-            update = { view -> view.player = player }
-        )
-        if (activeText != null) {
+    val density = LocalDensity.current
+    BoxWithConstraints(modifier.clip(RoundedCornerShape(16.dp)).background(Color.Black)) {
+        if (activeVisual?.kind == VisualKind.IMAGE && activeVisual.thumbnail != null) {
+            ComposeImage(activeVisual.thumbnail.asImageBitmap(), contentDescription = activeVisual.name, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
+        } else if (activeVisual?.kind == VisualKind.VIDEO) {
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { viewContext ->
+                    PlayerView(viewContext).apply {
+                        useController = false
+                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                        this.player = player
+                    }
+                },
+                update = { it.player = player }
+            )
+        } else {
+            Text("Ana sıraya video veya görsel ekle", color = VireonMuted, modifier = Modifier.align(Alignment.Center))
+        }
+        activeTexts.forEach { overlay ->
             Text(
-                text = activeText.value,
+                text = overlay.value,
                 color = Color.White,
-                fontSize = 23.sp,
+                fontSize = overlay.sizeSp.sp,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier
                     .align(Alignment.Center)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color.Black.copy(alpha = 0.58f))
-                    .padding(horizontal = 14.dp, vertical = 9.dp)
+                    .offset(x = maxWidth * (overlay.x - 0.5f), y = maxHeight * (overlay.y - 0.5f))
+                    .graphicsLayer { rotationZ = overlay.rotationDegrees }
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color.Black.copy(alpha = 0.52f))
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .pointerInput(overlay.id, overlay.x, overlay.y, maxWidth, maxHeight) {
+                        detectDragGestures { change, drag ->
+                            change.consume()
+                            val widthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
+                            val heightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
+                            onMoveText(
+                                overlay.id,
+                                (overlay.x + drag.x / widthPx).coerceIn(0.05f, 0.95f),
+                                (overlay.y + drag.y / heightPx).coerceIn(0.05f, 0.95f)
+                            )
+                        }
+                    }
+            )
+        }
+        IconButton(
+            onClick = onTogglePlayback,
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp).background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(30.dp))
+        ) {
+            Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = if (isPlaying) "Duraklat" else "Oynat", tint = Color.White)
+        }
+        if (activeVisual != null) {
+            Text(
+                activeVisual.name,
+                color = Color.White,
+                fontSize = 9.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.align(Alignment.TopStart).padding(7.dp).background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(5.dp)).padding(horizontal = 6.dp, vertical = 3.dp)
             )
         }
     }
 }
+
 @Composable
 private fun TimelinePanel(
-    audioLabel: String?,
-    clips: List<TimelineClip>,
-    selectedIndex: Int,
-    currentPositionMs: Long,
-    thumbnails: List<TimelineThumbnail>,
-    textOverlays: List<TimelineText>,
-    onScrub: (Int, Long) -> Unit,
+    visualClips: List<VisualClip>,
+    audioClips: List<AudioClip>,
+    textOverlays: List<TextOverlay>,
+    totalDurationMs: Long,
+    playheadMs: Long,
+    selectedVisualId: Long?,
+    selectedAudioId: Long?,
+    selectedTextId: Long?,
+    onScrub: (Long) -> Unit,
+    onSelectVisual: (Long) -> Unit,
+    onSelectAudio: (Long) -> Unit,
+    onSelectText: (Long) -> Unit,
+    onEditText: (Long) -> Unit,
+    onMoveAudio: (Long, Long) -> Unit,
+    onMoveText: (Long, Long) -> Unit,
+    canPreviousCut: Boolean,
+    canNextCut: Boolean,
+    onPreviousCut: () -> Unit,
+    onNextCut: () -> Unit,
     onSplit: () -> Unit,
-    onTrimStart: () -> Unit,
-    onTrimEnd: () -> Unit,
-    onMoveLeft: () -> Unit,
-    onMoveRight: () -> Unit,
+    onTrimVisualStart: () -> Unit,
+    onTrimVisualEnd: () -> Unit,
+    onMoveVisualLeft: () -> Unit,
+    onMoveVisualRight: () -> Unit,
+    onRemoveAudio: (Long) -> Unit,
+    onTrimAudioStart: (Long) -> Unit,
+    onTrimAudioEnd: (Long) -> Unit,
+    onVolumeChange: (Long, Float) -> Unit,
+    onImageDurationChange: (Long, Float) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val selectedClip = clips.getOrNull(selectedIndex)
-    val canSplit = selectedClip != null &&
-        currentPositionMs >= 500L && currentPositionMs <= selectedClip.durationMs - 500L
-    val canTrimStart = selectedClip != null &&
-        currentPositionMs >= 500L && currentPositionMs < selectedClip.durationMs - 500L
-    val canTrimEnd = selectedClip != null &&
-        currentPositionMs >= 500L && currentPositionMs < selectedClip.durationMs - 500L
-    val clipWidthsDp = clips.map { (it.durationMs / 1000f * 34f).coerceIn(112f, 360f) }
-    val density = androidx.compose.ui.platform.LocalDensity.current
-    val clipWidthsPx = clipWidthsDp.map { with(density) { it.dp.toPx() } }
-    val timelineWidthDp = clipWidthsDp.sum().coerceAtLeast(112f)
-    val totalWidthPx = clipWidthsPx.sum()
-
-    fun scrubAt(rawX: Float) {
-        if (clips.isEmpty() || totalWidthPx <= 0f) return
-        var remainingX = rawX.coerceIn(0f, totalWidthPx)
-        for (index in clips.indices) {
-            val widthPx = clipWidthsPx[index].coerceAtLeast(1f)
-            if (remainingX <= widthPx || index == clips.lastIndex) {
-                val fraction = (remainingX / widthPx).coerceIn(0f, 1f)
-                onScrub(index, (clips[index].durationMs * fraction).toLong())
-                return
-            }
-            remainingX -= widthPx
-        }
-    }
-
-    var playheadX = 0f
-    if (selectedClip != null && selectedIndex in clipWidthsPx.indices) {
-        playheadX = clipWidthsPx.take(selectedIndex).sum() +
-            clipWidthsPx[selectedIndex] *
-            (currentPositionMs.toFloat() / selectedClip.durationMs.coerceAtLeast(1L)).coerceIn(0f, 1f)
-    }
+    val selectedVisual = visualClips.firstOrNull { it.id == selectedVisualId }
+    val selectedVisualIndex = visualClips.indexOfFirst { it.id == selectedVisualId }
+    val selectedAudio = audioClips.firstOrNull { it.id == selectedAudioId }
+    val selectedText = textOverlays.firstOrNull { it.id == selectedTextId }
+    val location = locateVisual(visualClips, playheadMs)
+    val selectedLocalMs = if (location != null && visualClips.getOrNull(location.index)?.id == selectedVisualId) location.localMs else 0L
+    val canCut = selectedVisual != null && selectedLocalMs >= 500L && selectedLocalMs <= selectedVisual.durationMs - 500L
+    val pxPerMs = timelineScale(totalDurationMs)
+    val timelineWidth = (totalDurationMs.coerceAtLeast(1L) * pxPerMs).coerceAtLeast(320f).dp
+    val density = LocalDensity.current
+    val horizontalScroll = rememberScrollState()
 
     Column(
-        modifier = modifier
-            .background(VireonSurface)
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 9.dp, vertical = 8.dp)
+        modifier = modifier.background(VireonSurface).verticalScroll(rememberScrollState()).padding(horizontal = 8.dp, vertical = 7.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Zaman çizelgesi", color = VireonText, fontSize = 13.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.weight(1f))
-            Text(
-                if (clips.isEmpty()) "Video hazırlanıyor…" else "Klip ${selectedIndex + 1}/${clips.size}",
-                color = VireonMuted,
-                fontSize = 10.sp
+            Text("${formatTimelineTime(playheadMs)} / ${formatTimelineTime(totalDurationMs)}", color = VireonMuted, fontSize = 10.sp)
+        }
+        Spacer(Modifier.height(5.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+            TimelineAction("◀ Kesit", canPreviousCut, onPreviousCut)
+            TimelineAction("Kesit ▶", canNextCut, onNextCut)
+            TimelineAction("Böl", canCut, onSplit)
+            TimelineAction("Başı kırp", canCut, onTrimVisualStart)
+            TimelineAction("Sonu kırp", canCut, onTrimVisualEnd)
+            TimelineAction("←", selectedVisualIndex > 0, onMoveVisualLeft)
+            TimelineAction("→", selectedVisualIndex >= 0 && selectedVisualIndex < visualClips.lastIndex, onMoveVisualRight)
+        }
+        if (selectedVisual?.kind == VisualKind.IMAGE) {
+            Text("Görsel süresi: ${(selectedVisual.durationMs / 1000f).let { "%.1f".format(it) }} sn", color = VireonText, fontSize = 11.sp)
+            Slider(
+                value = selectedVisual.durationMs.toFloat().coerceIn(1_000f, 30_000f),
+                onValueChange = { onImageDurationChange(selectedVisual.id, it.coerceIn(1_000f, 30_000f)) },
+                valueRange = 1_000f..30_000f
             )
         }
-        Spacer(Modifier.height(3.dp))
-        Text(
-            if (selectedClip == null) "Video süresi okunuyor"
-            else "İmleç ${formatTimelineTime(currentPositionMs)}  •  Klip ${formatTimelineTime(selectedClip.durationMs)}",
-            color = VireonMuted,
-            fontSize = 10.sp
-        )
-        Spacer(Modifier.height(6.dp))
-        Text(
-            "Karelere dokun veya sürükle; imleç oraya gider.",
-            color = VireonMuted,
-            fontSize = 9.sp
-        )
-        Spacer(Modifier.height(4.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            TimelineAction("Böl", canSplit, onSplit)
-            TimelineAction("Başı kırp", canTrimStart, onTrimStart)
-            TimelineAction("Sonu kırp", canTrimEnd, onTrimEnd)
-            TimelineAction("←", selectedIndex > 0, onMoveLeft)
-            TimelineAction("→", selectedIndex >= 0 && selectedIndex < clips.lastIndex, onMoveRight)
+        if (selectedAudio != null) {
+            Spacer(Modifier.height(3.dp))
+            Text("Ses: ${selectedAudio.name}", color = VireonText, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                TimelineAction("Başından 0,5 sn kes", selectedAudio.durationMs > 750L, { onTrimAudioStart(selectedAudio.id) })
+                TimelineAction("Sonundan 0,5 sn kes", selectedAudio.durationMs > 750L, { onTrimAudioEnd(selectedAudio.id) })
+                TimelineAction("Sesi sil", true, { onRemoveAudio(selectedAudio.id) })
+            }
+            Text("Ses seviyesi: ${(selectedAudio.volume * 100).roundToInt()}%", color = VireonMuted, fontSize = 10.sp)
+            Slider(value = selectedAudio.volume, onValueChange = { onVolumeChange(selectedAudio.id, it) }, valueRange = 0f..1f)
         }
-        Spacer(Modifier.height(7.dp))
-        if (clips.isEmpty()) {
-            Text("Video hazırlanıyor…", color = VireonMuted, fontSize = 10.sp)
+        if (selectedText != null) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Seçili yazı: ${selectedText.value}", color = VireonText, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                TimelineAction("Düzenle", true) { onEditText(selectedText.id) }
+            }
+            Text("${formatTimelineTime(selectedText.startMs)} – ${formatTimelineTime(selectedText.endMs)}  •  Önizlemede yazıyı sürükleyerek konumlandır", color = VireonMuted, fontSize = 10.sp)
+        }
+
+        Spacer(Modifier.height(4.dp))
+        Text("ANA SIRA  •  Video ve görseller ardışık", color = VireonMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(3.dp))
+        if (visualClips.isEmpty()) {
+            Text("Video veya görsel ekleyerek başla.", color = VireonMuted, fontSize = 11.sp)
         } else {
-            Row(
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.Start
-            ) {
+            Column(Modifier.horizontalScroll(horizontalScroll)) {
                 Box(
-                    modifier = Modifier
-                        .width(timelineWidthDp.dp)
-                        .height(88.dp)
-                        .pointerInput(clips, clipWidthsPx) {
-                            detectTapGestures { scrubAt(it.x) }
+                    modifier = Modifier.width(timelineWidth).height(20.dp)
+                        .pointerInput(totalDurationMs, visualClips) {
+                            detectTapGestures { point -> onScrub(timeFromX(point.x, size.width.toFloat(), totalDurationMs, visualClips)) }
                         }
-                        .pointerInput(clips, clipWidthsPx) {
+                        .pointerInput(totalDurationMs, visualClips) {
                             detectDragGestures(
-                                onDragStart = { scrubAt(it.x) },
+                                onDragStart = { point -> onScrub(timeFromX(point.x, size.width.toFloat(), totalDurationMs, visualClips)) },
                                 onDrag = { change, _ ->
-                                    scrubAt(change.position.x)
+                                    onScrub(timeFromX(change.position.x, size.width.toFloat(), totalDurationMs, visualClips))
                                     change.consume()
                                 }
                             )
                         }
                 ) {
+                    Text("0:00", color = VireonMuted, fontSize = 9.sp, modifier = Modifier.align(Alignment.CenterStart))
+                    Text(formatTimelineTime(totalDurationMs), color = VireonMuted, fontSize = 9.sp, modifier = Modifier.align(Alignment.CenterEnd))
+                }
+                Box(Modifier.width(timelineWidth).height(66.dp)) {
                     Row(Modifier.fillMaxSize()) {
-                        clips.forEachIndexed { index, clip ->
-                            val candidates = thumbnails.filter {
-                                it.timeMs >= clip.startMs && it.timeMs <= clip.endMs
-                            }
-                            val frames = if (candidates.isNotEmpty()) {
-                                if (candidates.size <= 5) candidates else List(5) { frameIndex ->
-                                    candidates[frameIndex * (candidates.lastIndex) / 4]
-                                }
-                            } else {
-                                thumbnails.minByOrNull { kotlin.math.abs(it.timeMs - (clip.startMs + clip.endMs) / 2L) }
-                                    ?.let { listOf(it) } ?: emptyList()
-                            }
+                        visualClips.forEachIndexed { index, clip ->
+                            val clipWidth = (clip.durationMs * pxPerMs).coerceAtLeast(22f).dp
                             Box(
-                                modifier = Modifier
-                                    .width(clipWidthsDp[index].dp)
-                                    .fillMaxHeight()
-                                    .padding(end = 3.dp)
-                                    .clip(RoundedCornerShape(7.dp))
-                                    .border(
-                                        width = if (index == selectedIndex) 2.dp else 1.dp,
-                                        color = if (index == selectedIndex) VireonBlue else VireonSurfaceElevated,
-                                        shape = RoundedCornerShape(7.dp)
-                                    )
+                                Modifier.width(clipWidth).fillMaxHeight().padding(end = 2.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .border(if (clip.id == selectedVisualId) 2.dp else 1.dp, if (clip.id == selectedVisualId) VireonBlue else VireonSurfaceElevated, RoundedCornerShape(6.dp))
                                     .background(VireonSurfaceElevated)
+                                    .clickable { onSelectVisual(clip.id) }
                             ) {
-                                if (frames.isNotEmpty()) {
-                                    Row(Modifier.fillMaxSize()) {
-                                        frames.forEach { frame ->
-                                            Image(
-                                                bitmap = frame.bitmap.asImageBitmap(),
-                                                contentDescription = "Video karesi",
-                                                contentScale = ContentScale.Crop,
-                                                modifier = Modifier.weight(1f).fillMaxHeight()
-                                            )
-                                        }
-                                    }
+                                if (clip.thumbnail != null) {
+                                    ComposeImage(clip.thumbnail.asImageBitmap(), contentDescription = clip.name, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
                                 }
                                 Text(
-                                    "Klip ${index + 1}",
+                                    if (clip.kind == VisualKind.VIDEO) "VID ${index + 1}" else "IMG ${index + 1}",
                                     color = Color.White,
-                                    fontSize = 9.sp,
+                                    fontSize = 8.sp,
                                     fontWeight = FontWeight.Bold,
-                                    modifier = Modifier
-                                        .align(Alignment.TopStart)
-                                        .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(bottomEnd = 5.dp))
-                                        .padding(horizontal = 5.dp, vertical = 2.dp)
+                                    modifier = Modifier.align(Alignment.TopStart).background(Color.Black.copy(alpha = 0.56f), RoundedCornerShape(bottomEnd = 5.dp)).padding(horizontal = 4.dp, vertical = 2.dp)
                                 )
                                 Text(
                                     formatTimelineTime(clip.durationMs),
                                     color = Color.White,
-                                    fontSize = 9.sp,
-                                    modifier = Modifier
-                                        .align(Alignment.BottomEnd)
-                                        .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(topStart = 5.dp))
-                                        .padding(horizontal = 5.dp, vertical = 2.dp)
+                                    fontSize = 8.sp,
+                                    modifier = Modifier.align(Alignment.BottomEnd).background(Color.Black.copy(alpha = 0.56f), RoundedCornerShape(topStart = 5.dp)).padding(horizontal = 4.dp, vertical = 2.dp)
                                 )
                             }
                         }
                     }
-                    androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
-                        val x = playheadX.coerceIn(1f, (size.width - 1f).coerceAtLeast(1f))
-                        drawLine(
-                            color = Color.White,
-                            start = Offset(x, 0f),
-                            end = Offset(x, size.height),
-                            strokeWidth = 2.dp.toPx()
-                        )
-                        drawCircle(color = Color.White, radius = 5.dp.toPx(), center = Offset(x, 5.dp.toPx()))
-                    }
+                    TimelineGuides(visualClips, totalDurationMs, playheadMs)
+                }
+
+                Spacer(Modifier.height(7.dp))
+                Text("SES KATMANI  •  Bağımsız konumlandır", color = VireonMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(3.dp))
+                AudioTimelineLane(
+                    clips = audioClips,
+                    selectedId = selectedAudioId,
+                    totalWidth = timelineWidth,
+                    totalDurationMs = totalDurationMs,
+                    playheadMs = playheadMs,
+                    pxPerMs = pxPerMs,
+                    density = density.density,
+                    onSelect = onSelectAudio,
+                    onMove = onMoveAudio
+                )
+                Spacer(Modifier.height(7.dp))
+                Text("YAZI KATMANI  •  Bağımsız konumlandır", color = VireonMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(3.dp))
+                TextTimelineLane(
+                    clips = textOverlays,
+                    selectedId = selectedTextId,
+                    totalWidth = timelineWidth,
+                    totalDurationMs = totalDurationMs,
+                    playheadMs = playheadMs,
+                    pxPerMs = pxPerMs,
+                    density = density.density,
+                    onSelect = onSelectText,
+                    onMove = onMoveText
+                )
+            }
+        }
+        Spacer(Modifier.height(5.dp))
+        Text("İpucu: İmleci kesit çizgisine yaklaştırınca otomatik hizalanır. Kesit düğmeleri önceki/sonraki sınıra atlar.", color = VireonMuted, fontSize = 9.sp)
+    }
+}
+
+@Composable
+private fun AudioTimelineLane(
+    clips: List<AudioClip>,
+    selectedId: Long?,
+    totalWidth: Dp,
+    totalDurationMs: Long,
+    playheadMs: Long,
+    pxPerMs: Float,
+    density: Float,
+    onSelect: (Long) -> Unit,
+    onMove: (Long, Long) -> Unit
+) {
+    Box(Modifier.width(totalWidth).height(46.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xFF2B2042))) {
+        clips.forEach { clip ->
+            val x = (clip.timelineStartMs * pxPerMs).dp
+            val width = (clip.durationMs * pxPerMs).coerceAtLeast(30f).dp
+            Box(
+                Modifier.offset(x = x).width(width).fillMaxHeight().padding(end = 2.dp)
+                    .clip(RoundedCornerShape(5.dp))
+                    .border(if (clip.id == selectedId) 2.dp else 1.dp, if (clip.id == selectedId) VireonBlue else VireonPurple, RoundedCornerShape(5.dp))
+                    .background(VireonPurple.copy(alpha = 0.78f))
+                    .clickable { onSelect(clip.id) }
+                    .pointerInput(clip.id, pxPerMs) {
+                        var draggedStartMs = clip.timelineStartMs
+                        detectDragGestures(onDragStart = { draggedStartMs = clip.timelineStartMs; onSelect(clip.id) }) { change, drag ->
+                            change.consume()
+                            val deltaMs = (drag.x / density / pxPerMs).toLong()
+                            draggedStartMs = (draggedStartMs + deltaMs).coerceAtLeast(0L)
+                            onMove(clip.id, draggedStartMs)
+                        }
+                    },
+                contentAlignment = Alignment.CenterStart
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 5.dp)) {
+                    Icon(Icons.Default.MusicNote, contentDescription = null, tint = Color.White, modifier = Modifier.size(12.dp))
+                    Spacer(Modifier.width(3.dp))
+                    Text(clip.name, color = Color.White, fontSize = 8.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
         }
-        Spacer(Modifier.height(7.dp))
-        TimelineTrack(
-            icon = Icons.Default.MusicNote,
-            label = audioLabel ?: "Müzik ekle",
-            color = VireonPurple,
-            modifier = Modifier.height(22.dp)
-        )
-        Spacer(Modifier.height(4.dp))
-        if (textOverlays.isEmpty()) {
-            TimelineTrack(
-                icon = Icons.Default.TextFields,
-                label = "Metin eklemek için soldan Metin'e dokun",
-                color = VireonGreen,
-                modifier = Modifier.height(22.dp)
-            )
-        } else {
-            textOverlays.forEach { overlay ->
-                TimelineTrack(
-                    icon = Icons.Default.TextFields,
-                    label = overlay.value,
-                    color = VireonGreen,
-                    modifier = Modifier.height(22.dp)
-                )
-                Spacer(Modifier.height(3.dp))
-            }
-        }
+        TimelinePlayhead(playheadMs, totalDurationMs, totalWidth)
     }
 }
+
+@Composable
+private fun TextTimelineLane(
+    clips: List<TextOverlay>,
+    selectedId: Long?,
+    totalWidth: Dp,
+    totalDurationMs: Long,
+    playheadMs: Long,
+    pxPerMs: Float,
+    density: Float,
+    onSelect: (Long) -> Unit,
+    onMove: (Long, Long) -> Unit
+) {
+    Box(Modifier.width(totalWidth).height(44.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xFF1C302A))) {
+        clips.forEach { clip ->
+            val x = (clip.startMs * pxPerMs).dp
+            val width = ((clip.endMs - clip.startMs) * pxPerMs).coerceAtLeast(36f).dp
+            Box(
+                Modifier.offset(x = x).width(width).fillMaxHeight().padding(end = 2.dp)
+                    .clip(RoundedCornerShape(5.dp))
+                    .border(if (clip.id == selectedId) 2.dp else 1.dp, if (clip.id == selectedId) VireonBlue else VireonGreen, RoundedCornerShape(5.dp))
+                    .background(VireonGreen.copy(alpha = 0.76f))
+                    .clickable { onSelect(clip.id) }
+                    .pointerInput(clip.id, pxPerMs) {
+                        var draggedStartMs = clip.startMs
+                        detectDragGestures(onDragStart = { draggedStartMs = clip.startMs; onSelect(clip.id) }) { change, drag ->
+                            change.consume()
+                            val deltaMs = (drag.x / density / pxPerMs).toLong()
+                            draggedStartMs = (draggedStartMs + deltaMs).coerceAtLeast(0L)
+                            onMove(clip.id, draggedStartMs)
+                        }
+                    },
+                contentAlignment = Alignment.CenterStart
+            ) {
+                Text(clip.value, color = Color.White, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 6.dp))
+            }
+        }
+        TimelinePlayhead(playheadMs, totalDurationMs, totalWidth)
+    }
+}
+
+@Composable
+private fun TimelinePlayhead(playheadMs: Long, totalDurationMs: Long, totalWidth: Dp) {
+    val x = if (totalDurationMs > 0L) (totalWidth.value * playheadMs.toFloat() / totalDurationMs).coerceIn(0f, totalWidth.value) else 0f
+    Canvas(Modifier.fillMaxSize()) {
+        val px = x.dp.toPx()
+        drawLine(Color.White, Offset(px, 0f), Offset(px, size.height), 2.dp.toPx())
+    }
+}
+
+@Composable
+private fun TimelineGuides(clips: List<VisualClip>, totalDurationMs: Long, playheadMs: Long) {
+    Canvas(Modifier.fillMaxSize()) {
+        var elapsed = 0L
+        clips.dropLast(1).forEach { clip ->
+            elapsed += clip.durationMs
+            val x = if (totalDurationMs > 0L) elapsed.toFloat() / totalDurationMs * size.width else 0f
+            drawLine(Color(0xFFFFD166), Offset(x, 0f), Offset(x, size.height), 1.dp.toPx())
+            drawCircle(Color(0xFFFFD166), 3.dp.toPx(), Offset(x, 5.dp.toPx()))
+        }
+        val cursorX = if (totalDurationMs > 0L) (playheadMs.toFloat() / totalDurationMs * size.width).coerceIn(0f, size.width) else 0f
+        drawLine(Color.White, Offset(cursorX, 0f), Offset(cursorX, size.height), 2.dp.toPx())
+    }
+}
+
 @Composable
 private fun TimelineAction(label: String, enabled: Boolean, onClick: () -> Unit) {
     OutlinedButton(
         onClick = onClick,
         enabled = enabled,
-        modifier = Modifier.height(32.dp),
-        contentPadding = PaddingValues(horizontal = 9.dp, vertical = 0.dp),
-        shape = RoundedCornerShape(9.dp)
-    ) {
-        Text(label, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+        modifier = Modifier.height(31.dp),
+        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+        shape = RoundedCornerShape(8.dp)
+    ) { Text(label, fontSize = 9.sp, fontWeight = FontWeight.SemiBold, maxLines = 1) }
+}
+
+private fun timelineScale(totalDurationMs: Long): Float {
+    if (totalDurationMs <= 0L) return 0.036f
+    return (maxOf(320f, totalDurationMs / 1_000f * 36f) / totalDurationMs.toFloat())
+}
+
+private fun timeFromX(x: Float, widthPx: Float, totalDurationMs: Long, clips: List<VisualClip>): Long {
+    if (widthPx <= 0f || totalDurationMs <= 0L) return 0L
+    val raw = (x.coerceIn(0f, widthPx) / widthPx * totalDurationMs).toLong()
+    return snapToCut(raw, clips, 220L)
+}
+
+private fun locateVisual(clips: List<VisualClip>, positionMs: Long): LocatedClip? {
+    if (clips.isEmpty()) return null
+    var elapsed = 0L
+    clips.forEachIndexed { index, clip ->
+        val end = elapsed + clip.durationMs
+        if (positionMs < end || index == clips.lastIndex) {
+            return LocatedClip(index, (positionMs - elapsed).coerceIn(0L, clip.durationMs), elapsed)
+        }
+        elapsed = end
     }
+    val last = clips.lastIndex
+    return LocatedClip(last, clips[last].durationMs, clips.take(last).sumOf { it.durationMs })
+}
+
+private fun cutBoundaries(clips: List<VisualClip>): List<Long> {
+    var elapsed = 0L
+    val boundaries = mutableListOf<Long>()
+    clips.dropLast(1).forEach { clip ->
+        elapsed += clip.durationMs
+        boundaries.add(elapsed)
+    }
+    return boundaries
+}
+
+private fun snapToCut(positionMs: Long, clips: List<VisualClip>, thresholdMs: Long): Long {
+    val nearest = cutBoundaries(clips).minByOrNull { abs(it - positionMs) } ?: return positionMs
+    return if (abs(nearest - positionMs) <= thresholdMs) nearest else positionMs
 }
 
 private fun formatTimelineTime(milliseconds: Long): String {
-    val totalSeconds = milliseconds.coerceAtLeast(0L) / 1000L
-    val minutes = totalSeconds / 60L
-    val seconds = totalSeconds % 60L
-    return "%02d:%02d".format(minutes, seconds)
+    val seconds = milliseconds.coerceAtLeast(0L) / 1_000L
+    return "%02d:%02d".format(seconds / 60L, seconds % 60L)
 }
 
-@Composable
-private fun TimelineTrack(
-    icon: ImageVector,
-    label: String,
-    color: Color,
-    modifier: Modifier = Modifier
-) {
-    Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Icon(icon, contentDescription = null, tint = VireonMuted, modifier = Modifier.size(15.dp))
-        Spacer(Modifier.width(7.dp))
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxHeight()
-                .clip(RoundedCornerShape(7.dp))
-                .background(color)
-                .padding(horizontal = 9.dp),
-            contentAlignment = Alignment.CenterStart
-        ) {
-            Text(label, color = Color.White, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+private suspend fun inspectVisual(context: Context, uri: Uri, kind: VisualKind, id: Long): VisualClip = withContext(Dispatchers.IO) {
+    val name = queryDisplayName(context, uri)
+    if (kind == VisualKind.IMAGE) {
+        val bitmap = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+        VisualClip(id, uri.toString(), name, kind, imageDurationMs = 3_000L, thumbnail = bitmap?.let(::scaledBitmap))
+    } else {
+        val retriever = MediaMetadataRetriever()
+        var duration = 0L
+        var frame: Bitmap? = null
+        try {
+            retriever.setDataSource(context, uri)
+            duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            frame = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+        } catch (_: Exception) {
+            // Invalid or unsupported video: retain the entry so the user can see the import failure.
+        } finally {
+            runCatching { retriever.release() }
         }
+        VisualClip(
+            id = id,
+            uri = uri.toString(),
+            name = name,
+            kind = kind,
+            sourceStartMs = 0L,
+            sourceEndMs = duration.coerceAtLeast(500L),
+            thumbnail = frame?.let(::scaledBitmap)
+        )
     }
 }
 
+private suspend fun inspectAudio(context: Context, uri: Uri): Pair<String, Long> = withContext(Dispatchers.IO) {
+    val retriever = MediaMetadataRetriever()
+    var duration = 0L
+    try {
+        retriever.setDataSource(context, uri)
+        duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+    } catch (_: Exception) {
+        duration = 0L
+    } finally {
+        runCatching { retriever.release() }
+    }
+    queryDisplayName(context, uri) to duration
+}
+
+private fun queryDisplayName(context: Context, uri: Uri): String {
+    var cursor: Cursor? = null
+    return try {
+        cursor = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+        if (cursor != null && cursor.moveToFirst()) {
+            cursor.getString(cursor.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) ?: "Medya"
+        } else uri.lastPathSegment?.substringAfterLast('/') ?: "Medya"
+    } catch (_: Exception) {
+        uri.lastPathSegment?.substringAfterLast('/') ?: "Medya"
+    } finally {
+        cursor?.close()
+    }
+}
+
+private fun scaledBitmap(source: Bitmap): Bitmap {
+    val factor = minOf(640f / source.width, 640f / source.height, 1f)
+    if (factor >= 1f) return source
+    val scaled = Bitmap.createScaledBitmap(source, (source.width * factor).roundToInt().coerceAtLeast(1), (source.height * factor).roundToInt().coerceAtLeast(1), true)
+    if (scaled !== source) source.recycle()
+    return scaled
+}
+
 @Composable
-private fun VireonMark(size: androidx.compose.ui.unit.Dp) {
-    Box(
-        modifier = Modifier
-            .size(size)
-            .clip(RoundedCornerShape(16.dp))
-            .background(VireonBlue),
-        contentAlignment = Alignment.Center
-    ) {
+private fun VireonMark(size: Dp) {
+    Box(Modifier.size(size).clip(RoundedCornerShape(16.dp)).background(VireonBlue), contentAlignment = Alignment.Center) {
         Text("V", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.Black)
     }
 }
